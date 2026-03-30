@@ -1,0 +1,745 @@
+%sql 
+WITH cte_variables AS (
+    SELECT 
+          ('2026-01-01')::date AS start_date
+        , (CURRENT_DATE)::date AS end_date
+)
+
+
+
+-- =====================================================
+-- ==============  1. BASE SESSIONS  ===================
+-- =====================================================
+, base_sessions AS (
+ SELECT s.web_context_anonymous_id
+   , s.webcontext_session_id
+   , s.session_start_ts_est
+   , s.session_start_date_est
+   , s.unique_pages_viewed
+   , s.first_page_no_query_string
+   , s.first_page_domain
+   , s.first_page_referrer_no_query_string
+   , s.first_page_referrer
+   , s.utility_area
+   , s.first_page_referrer_domain
+   , s.first_page_url_first_folder
+   , s.first_page_url
+   , s.isp_name
+   , s.is_bot
+   , s.device_type
+   , s.city
+   , s.entered_zip
+   , CASE WHEN s.is_product_viewed = 1  THEN 1 ELSE 0 END AS zip_entry
+   , s.is_product_viewed
+   --, viewed_offer_wall
+   , s.postal_code
+   , s.region
+   , s.mover_switcher
+   , s.latitude
+   , s.longitude
+   , case
+       when s.site_name = 'www.chooseenergy.com' and (s.Region = 'tx' OR s.first_page_url ILIKE '%texas%') then 'Choose TX'
+       when s.site_name = 'www.chooseenergy.com' and (s.Region != 'TX' OR s.region IS NULL AND s.first_page_url NOT ILIKE '%texas%') then 'Choose NTX'
+       when s.site_name = 'www.chooseenergy.com' and (s.first_page_url IN ('https://www.chooseenergy.com/', 'https://www.chooseenergy.com/providers/', 'https://www.chooseenergy.com/utilities/') AND s.region = 'tx') then 'Choose TX'
+       when s.site_name = 'www.chooseenergy.com' and (s.first_page_url IN ('https://www.chooseenergy.com/', 'https://www.chooseenergy.com/providers/', 'https://www.chooseenergy.com/utilities/') AND s.region != 'tx') then 'Choose NTX'
+       when s.site_name = 'saveonenergy.com' then 'SOE'
+       when s.site_name = 'choosetexaspower.org' then 'CTXP'
+       when s.site_name = 'texaselectricrates.com' then 'TXER'
+       else 'Unknown'
+       end as website
+
+   , CASE
+        WHEN s.campaign ILIKE '%^Display%' THEN 'Display'
+        WHEN s.traffic_source = 'Paid' AND s.traffic_channel = 'Search' THEN 'Paid Search'
+        WHEN s.traffic_source = 'Paid' AND s.traffic_channel = 'Pmax'   THEN 'pMax'
+        WHEN (s.first_page_referrer ILIKE '%chatgpt%' OR s.first_page_url ILIKE '%chatgpt%') or
+            s.first_page_referrer ILIKE '%copilot.microsoft%' or
+            s.first_page_referrer ILIKE '%perplexity%' or
+            s.first_page_referrer ILIKE '%gemini.google%' or 
+            s.first_page_referrer ILIKE '%claude%' or
+            s.first_page_referrer ILIKE '%andisearch%' or
+            s.first_page_referrer ILIKE '%bagoodex%' or
+            s.first_page_referrer ILIKE '%brave%' or
+            s.first_page_referrer ILIKE '%grok%' THEN 'AI Search'
+        WHEN s.traffic_source IN ('Direct')  AND s.traffic_channel IN ('Direct','Search') AND s.transactional_ind = 1 THEN 'Direct'
+        WHEN s.traffic_source IN ('Organic') AND s.traffic_channel IN ('Direct','Search') AND s.transactional_ind = 1 THEN 'Organic'
+        WHEN s.traffic_source IN ('Organic','Direct') AND s.traffic_channel IN ('Referral') AND s.transactional_ind = 1 THEN 'Referral'
+        WHEN s.traffic_source IN ('Affiliate','Affliate') THEN 'Affiliate'
+        WHEN s.traffic_source IN ('Email') OR s.traffic_channel IN ('Email') THEN 'Email'
+        WHEN s.traffic_source IN ('SMS')   OR s.traffic_channel IN ('SMS')   THEN 'SMS'
+        WHEN s.traffic_channel = 'Social' THEN 'Social'
+        WHEN s.traffic_channel = 'Internal' OR s.traffic_source = 'Internal' THEN 'Internal'
+        ELSE 'Other'
+    END AS marketing_channel,
+    CASE WHEN first_page_no_query_string IN ('www.chooseenergy.com', 'www.saveonenergy.com', 'www.choosetexaspower.org', 'www.texaselectricrates.com') THEN 1 ELSE 0 END as is_lp,
+
+    CASE WHEN s.landing_page ILIKE '%Provider%' THEN "Provider"
+         WHEN s.landing_page ILIKE '%Resources%' THEN "Resources"
+         WHEN s.landing_page ILIKE '%Grid%'      THEN "Grid"
+         ELSE s.landing_page END as landing_page_type  
+
+ FROM energy_prod.energy.v_sessions s
+ CROSS JOIN cte_variables var
+ WHERE s.session_start_date_est between var.start_date and var.end_date -- s.date_utc >= var.start_date
+   AND s.bot_ip_ind = 0
+   AND s.is_bot = false
+   AND (s.is_internal_ip = FALSE OR s.is_internal_ip IS NULL)
+   AND COALESCE(s.company_id, 25) = 25
+   AND s.first_page_url NOT ILIKE '%solar-energy%'
+   AND s.first_page_url NOT ILIKE '%resources%'
+   AND (s.non_texas_ind = 0 or s.campaign ilike '%a:SOE%')
+   AND (s.category IS NULL OR s.category != 'Non-Texas')
+   AND (LOWER(s.region) = 'tx' OR s.first_page_url ILIKE '%texas%' OR s.site_name NOT ILIKE '%chooseenergy%')
+
+)
+
+
+-- =====================================================
+-- ==============  2. Cart Funnel Section  =============
+-- =====================================================
+
+-- ===== 2.1 Cart Orders =====
+, cart_orders as (
+  select o.order_id,  
+    max(rev.gcv_new_v2) as order_gcv, 
+    max(o.partner_name) order_partner_name, 
+    max(o.product_name) order_product_name,
+    max(o.term) order_term_length, 
+    max(o.order_date_est) order_date_est, 
+    1 as cart_order
+  from energy_prod.energy.v_orders o
+  left join energy_prod.energy.v_orders_gcv rev ON o.order_id = rev.order_id
+  cross join cte_variables var
+  where o.order_date_est >= var.start_date
+    --and o.tenant_id in ('ffc8ff8a-1975-4ec4-8d59-900718adb53d', '4b27d1c6-e19e-4cc0-add3-a44b9b4a4023')
+    and o.order_type = 'Cart'
+    and o.anonymous_id is not null
+    AND o.order_date_est BETWEEN var.start_date AND var.end_date
+    AND o.txorder_ind = 1
+    AND COALESCE(o.company_id,25)=25
+    AND (o.tenant_id != 'src_1ax2zVVJJ2cB9aBFEnVcRPog5Pe' OR o.tenant_id IS NULL)
+    AND o.partner_name <> 'TXU Branded Energy'
+  group by all
+)
+
+-- ===== 2.2 Cart Sessions =====
+, cartsession_id_base AS (
+ SELECT c.cartsession_id
+   , c.websession_id
+   , co.order_gcv 
+   , c.first_partner_name
+   , c.first_product_name
+   , c.last_partner_name
+   , c.last_product_name
+   , co.order_partner_name
+   , co.order_product_name
+   , co.order_term_length
+   , co.cart_order
+ FROM energy_prod.energy.v_carts c
+ LEFT JOIN cart_orders co ON c.cartsession_id = co.order_id
+ CROSS JOIN cte_variables var
+ WHERE c.cartsession_start_date_est BETWEEN var.start_date and var.end_date
+  AND c.txmarketplace_ind = 1
+  AND c.bot_ip_ind = 0
+  AND c.is_internal_ip = FALSE
+  AND COALESCE(c.company_id, 25) = 25
+   --AND c.tenant_id IN ('ffc8ff8a-1975-4ec4-8d59-900718adb53d', '4b27d1c6-e19e-4cc0-add3-a44b9b4a4023')
+)
+
+
+-- ===== 2.3 Pivot Interaction =====
+, pivot_clicked AS (
+ SELECT fc.correlationId cart_instance_id, 1 pivot_clicked
+ FROM lakehouse_production.energy.event_redventures_usertracking_formcontinued fc
+ CROSS JOIN cte_variables var
+ WHERE fc.`_date` >= var.start_date
+   --AND fc.`_tenant` IN ('ffc8ff8a-1975-4ec4-8d59-900718adb53d', '4b27d1c6-e19e-4cc0-add3-a44b9b4a4023')
+   AND fc.step_context_step_name IN ('standard-pivot', 'prepaid-pivot','no-deposit-plans')
+ GROUP BY fc.correlationId
+
+ UNION
+
+ SELECT pc.cartContext.cartInstanceId cart_instance_id, 1 pivot_clicked
+ FROM lakehouse_production.energy.event_redventures_cart_productclicked pc
+ CROSS JOIN cte_variables var
+ WHERE pc.`_date` >= var.start_date
+   --and pc.`_tenant` IN ('ffc8ff8a-1975-4ec4-8d59-900718adb53d', '4b27d1c6-e19e-4cc0-add3-a44b9b4a4023')
+   AND (pc.product_location ILIKE '%pivot%' OR pc.product_location ILIKE 'no-deposit-plans')
+  
+ GROUP BY pc.cartContext.cartInstanceId
+)
+
+
+-- Mapping cart instance IDs to cart session IDs
+, cart_instance_join AS (
+ SELECT cs.cart_instance_id, MAX(cs.cart_session_id) cart_session_id
+ FROM lakehouse_production.energy.event_redventures_cart_cartstarted cs
+ CROSS JOIN cte_variables var
+ WHERE cs.`_date` >= var.start_date
+   --AND cs.`_tenant` IN ('ffc8ff8a-1975-4ec4-8d59-900718adb53d', '4b27d1c6-e19e-4cc0-add3-a44b9b4a4023')
+ GROUP BY cs.cart_instance_id
+)
+
+
+-- Final pivot click data
+, pivot_click_final AS (
+ SELECT cij.cart_session_id, MAX(pvc.pivot_clicked) pivot_clicked
+ FROM cart_instance_join cij
+ INNER JOIN pivot_clicked pvc ON pvc.cart_instance_id = cij.cart_instance_id
+ GROUP BY cij.cart_session_id
+)
+
+
+-- ===== 2.4 Credit Check =====
+, cart_first_credit_run_calc AS (
+ SELECT
+   cr.client_session_id,
+   cr._timeStamp AS sent_at,
+   cr.creditScore,
+   cr.creditRunId,
+   cr.providerName,
+   CASE WHEN cr.passSelectedThreshold = true THEN 'pass'
+     WHEN cr.passSelectedThreshold = false THEN 'fail'
+     ELSE 'other' END AS provider_pass,
+   ROW_NUMBER() OVER (PARTITION BY cr.client_session_id ORDER BY cr._timeStamp ASC) AS rn
+ FROM lakehouse_production.energy.event_energy_creditresult cr
+ CROSS JOIN cte_variables var
+ WHERE cr._date >= var.start_date
+   AND cr.client_session_id NOT LIKE 'WR%'
+   AND cr.web_session_id IS NOT NULL
+   --AND cr.`_tenant` IN ('ffc8ff8a-1975-4ec4-8d59-900718adb53d', '4b27d1c6-e19e-4cc0-add3-a44b9b4a4023')
+)
+
+
+, cart_first_credit_run AS (
+ SELECT
+   client_session_id,
+   creditScore first_run_credit_score,
+   providerName first_run_provider_name,
+   provider_pass first_run_provider_pass
+ FROM cart_first_credit_run_calc
+ WHERE rn = 1
+)
+
+
+, cart_agged_credit_run AS (
+ SELECT cr.client_session_id,
+   MIN(cr.`_timeStamp`) sent_at,
+   collect_list(DISTINCT cr.creditScore) unique_scores,
+   MAX(cr.creditScore) max_score,
+   COUNT(DISTINCT cr.creditRunId) credit_runs,
+   MAX(size(array_distinct(cr.providerFailed))) providers_failed,
+   MAX(size(array_distinct(cr.providerPassed))) providers_passed,
+   MAX(CASE WHEN cr.passLowestThreshold = true THEN 1 ELSE 0 END) ucc_pass,
+   MAX(CASE WHEN cr.passSelectedThreshold = true THEN 1 ELSE 0 END) provider_pass
+ FROM lakehouse_production.energy.event_energy_creditresult cr
+ CROSS JOIN cte_variables var
+ WHERE cr.`_date` >= var.start_date
+   AND cr.client_session_id NOT LIKE 'WR%'
+   AND cr.web_session_id IS NOT NULL
+   --AND cr.`_tenant` IN ('ffc8ff8a-1975-4ec4-8d59-900718adb53d', '4b27d1c6-e19e-4cc0-add3-a44b9b4a4023')
+ GROUP BY cr.client_session_id
+)
+
+
+, cart_final_credit_run AS (
+ SELECT fcr.client_session_id
+   , first_run_credit_score
+   , first_run_provider_name
+   , first_run_provider_pass
+   , CASE WHEN fcr.first_run_provider_pass = 'fail' THEN 1 ELSE 0 END credit_fail
+   , acr.unique_scores AS cart_unique_credit_scores
+   , acr.max_score AS cart_max_credit_score
+   , acr.credit_runs AS cart_credit_runs
+   , acr.providers_failed AS cart_providers_failed_credit
+   , acr.providers_passed AS cart_providers_passed_credit
+   , acr.ucc_pass AS cart_ucc_pass_credit
+ FROM cart_first_credit_run fcr
+ LEFT JOIN cart_agged_credit_run acr ON fcr.client_session_id = acr.client_session_id
+)
+
+
+-- ===== 2.5 Pivot Displayed =====
+, pivot_triggers_two_alt AS (
+ SELECT integration_context_client_session_id
+ FROM lakehouse_production.energy.event_energy_pivotresult
+ CROSS JOIN cte_variables var
+ WHERE _date > var.start_date
+   --AND site IN ('new.choosetexaspower.org','saveonenergy.com')
+ GROUP BY integration_context_client_session_id
+)
+
+
+-- ===== 2.6 Cart Through ROG? =====
+,rogs_indicator as (
+  SELECT 
+    session_id,
+    MAX(CASE 
+      WHEN webElement.elementType = 'Cart CTA' 
+        AND webElement.location = 'ROG' 
+        AND webElement.text = 'Check Availability' 
+      THEN 1 
+      ELSE 0 
+    END) as rogs_ind
+  FROM lakehouse_production.energy.event_redventures_usertracking_elementclicked
+  CROSS JOIN cte_variables var
+  WHERE _date > var.start_date
+  GROUP BY session_id
+)
+
+-- ===== 2.7 Cart Info Submits (Contact Info + Address Capture, PII Input, SSN Input) =====
+-- Cart info submits broken down (Contact Info + Address Capture, PII Input, SSN Input)
+, step_completions AS (
+  SELECT
+    cartsession_id_completions,
+    MAX(page_1_completion)        AS page_1_completion,
+    MAX(customer_info_completion)  AS customer_info_completion,
+    MAX(ssn_completion)            AS ssn_completion
+  FROM (
+    -- cart_formcontinued (uses order_session_id)
+    SELECT
+      fc2.order_session_id AS cartsession_id_completions,
+      MAX(CASE WHEN fc2.cartContext_pageReferrer ILIKE '%mover-switcher%' THEN 1 END) AS page_1_completion,
+      MAX(CASE WHEN fc2.formContext.formName = 'PersonalInfo'       THEN 1 END)       AS customer_info_completion,
+      MAX(CASE WHEN fc2.formContext.formName = 'CreditVerification' THEN 1 END)       AS ssn_completion
+    FROM lakehouse_production.energy.event_redventures_cart_formcontinued fc2
+    CROSS JOIN cte_variables var
+    WHERE fc2._date > var.start_date
+    GROUP BY fc2.order_session_id
+
+    UNION ALL
+
+    -- usertracking_formcontinued (resolve cart_instance -> cart_session)
+    SELECT
+      cs.cart_session_id AS cartsession_id_completions,
+      MAX(CASE WHEN fc3.step_context_step_name = 'connection-info'     THEN 1 END) AS page_1_completion,
+      MAX(CASE WHEN fc3.step_context_step_name = 'contact-info'        THEN 1 END) AS customer_info_completion,
+      MAX(CASE WHEN fc3.step_context_step_name = 'credit-verification' THEN 1 END) AS ssn_completion
+    FROM lakehouse_production.energy.event_redventures_usertracking_formcontinued fc3
+    JOIN (
+      SELECT cart_instance_id, MAX(cart_session_id) AS cart_session_id
+      FROM lakehouse_production.energy.event_redventures_cart_cartstarted
+      GROUP BY cart_instance_id
+    ) cs ON cs.cart_instance_id = fc3.correlationId
+    CROSS JOIN cte_variables var
+    WHERE fc3.form_context_form_name = 'Cart'
+      AND fc3._date > var.start_date
+    GROUP BY cs.cart_session_id
+  ) z
+  GROUP BY cartsession_id_completions
+)
+
+-- ===== 2.8 Partner Qualification =====
+, attempts AS (
+  SELECT qr.client_session_id, qr.web_session_id, qr.response, qr.providerName, qr.step, qr._timeStamp,
+         ROW_NUMBER() OVER (PARTITION BY qr.client_session_id, qr.step ORDER BY qr._timeStamp) rn
+  FROM lakehouse_production.energy.event_energy_qualificationresult qr
+  CROSS JOIN cte_variables var
+  WHERE qr._date >= var.start_date
+)
+, first_midflow AS (
+  SELECT client_session_id, web_session_id, response AS midflow_response, providerName AS midflow_provider
+  FROM attempts
+  WHERE step = 'MID-FLOW' AND rn = 1
+)
+, first_enrollment AS (
+  SELECT client_session_id, web_session_id, response AS enrollment_response, providerName AS enrollment_provider
+  FROM attempts
+  WHERE step = 'ENROLLMENT' AND rn = 1
+)
+, agg_qual AS (
+  SELECT qr.client_session_id, qr.web_session_id,
+         SUM(CASE WHEN qr.response = 'FAILURE' THEN 1 ELSE 0 END) AS qual_failures,
+         SUM(CASE WHEN qr.response = 'SUCCESS' THEN 1 ELSE 0 END) AS qual_successes
+  FROM lakehouse_production.energy.event_energy_qualificationresult qr
+  CROSS JOIN cte_variables var
+  WHERE qr._date >= var.start_date
+  GROUP BY qr.client_session_id, qr.web_session_id
+)
+, qual_final AS (
+  SELECT
+    COALESCE(fm.client_session_id, fe.client_session_id, aq.client_session_id) AS client_session_id,
+    COALESCE(fm.web_session_id,    fe.web_session_id,    aq.web_session_id)    AS web_session_id,
+    fm.midflow_response, fe.enrollment_response,
+    CASE WHEN fm.midflow_response = 'FAILURE' OR fe.enrollment_response = 'FAILURE' THEN 1 ELSE 0 END AS qual_fail,
+    aq.qual_failures, aq.qual_successes
+  FROM first_midflow fm
+  FULL JOIN first_enrollment fe
+    ON fm.client_session_id = fe.client_session_id AND fm.web_session_id = fe.web_session_id
+  LEFT JOIN agg_qual aq
+    ON COALESCE(fm.client_session_id, fe.client_session_id) = aq.client_session_id
+   AND COALESCE(fm.web_session_id,    fe.web_session_id)    = aq.web_session_id
+)
+
+-- ===== 2.9 Volt Check =====
+, first_fail AS (
+  SELECT vf.sessionId, vf.voltStepFailed AS first_fail_reason,
+         ROW_NUMBER() OVER (PARTITION BY vf.sessionId ORDER BY vf._timeStamp) rn
+  FROM lakehouse_production.energy.event_energy_voltfailure vf
+  CROSS JOIN cte_variables var
+  WHERE vf._date >= var.start_date
+)
+, agg_fail AS (
+  SELECT vf.sessionId,
+         SUM(CASE WHEN vf.voltStepFailed = 'Negative List' THEN 1 ELSE 0 END) AS negative_list_fail_count,
+         SUM(CASE WHEN vf.voltStepFailed = 'SEON' THEN 1 ELSE 0 END) AS seon_fail_count
+  FROM lakehouse_production.energy.event_energy_voltfailure vf
+  CROSS JOIN cte_variables var
+  WHERE vf._date >= var.start_date
+  GROUP BY vf.sessionId
+)
+, volt_fail AS (
+  SELECT ff.sessionId AS client_session_id,
+         ff.first_fail_reason,
+         af.negative_list_fail_count,
+         af.seon_fail_count,
+         1 AS volt_fail
+  FROM first_fail ff
+  JOIN agg_fail af ON af.sessionId = ff.sessionId
+  WHERE ff.rn = 1
+)
+
+-- , pivot_triggers_two_alt AS (
+--   SELECT integration_context_client_session_id
+--   FROM lakehouse_production.energy.event_energy_pivotresult
+--   CROSS JOIN cte_variables var
+--   WHERE _date > var.start_date
+--   GROUP BY integration_context_client_session_id
+-- )
+
+
+-- ===== 2.10 Review Page Clicks =====
+, review_page AS (
+  SELECT cartsession_id_review,
+         MAX(clicked_review_page_cta) AS clicked_review_page_cta
+  FROM (
+    -- Formsubmitted event
+    SELECT cs.cart_session_id AS cartsession_id_review,
+           MAX(CASE WHEN fc.cartcontext.pagereferrer ILIKE '%review%' THEN 1 END) AS clicked_review_page_cta
+    FROM lakehouse_production.energy.event_redventures_cart_formsubmitted fc
+    JOIN (
+      SELECT cart_instance_id, MAX(cart_session_id) AS cart_session_id
+      FROM lakehouse_production.energy.event_redventures_cart_cartstarted
+      GROUP BY cart_instance_id
+    ) cs ON fc.cart_instance_id = cs.cart_instance_id
+    CROSS JOIN cte_variables var
+    WHERE fc._date > var.start_date
+    GROUP BY cs.cart_session_id
+
+    UNION ALL
+
+    -- Usertracking formcontinued event
+    SELECT cs.cart_session_id AS cartsession_id_review,
+           MAX(CASE WHEN fc3.step_context_step_name = 'review' THEN 1 END) AS clicked_review_page_cta
+    FROM lakehouse_production.energy.event_redventures_usertracking_formcontinued fc3
+    JOIN (
+      SELECT cart_instance_id, MAX(cart_session_id) AS cart_session_id
+      FROM lakehouse_production.energy.event_redventures_cart_cartstarted
+      GROUP BY cart_instance_id
+    ) cs ON cs.cart_instance_id = fc3.correlationId
+    CROSS JOIN cte_variables var
+    WHERE fc3._date > var.start_date
+    GROUP BY cs.cart_session_id
+  ) z
+  GROUP BY cartsession_id_review
+)
+
+
+
+
+
+-- ===== 2.11 Finalized Cart Aggregate =====
+, cart_session_agg AS (
+  SELECT
+    s.webcontext_session_id,
+
+    -- Overall Cart Entries
+    COUNT(DISTINCT c.cartsession_id) AS cart_entries,
+    MAX(CASE WHEN c.cartsession_id IS NOT NULL THEN 1 ELSE 0 END) AS has_cart,
+
+    -- ROG Cart Entries
+    COUNT(DISTINCT CASE WHEN COALESCE(ri.rogs_ind, 0) = 1 THEN c.cartsession_id END) AS rog_cart_entries,
+    CASE WHEN COUNT(DISTINCT CASE WHEN COALESCE(ri.rogs_ind, 0) = 1 THEN c.cartsession_id END) >= 1 THEN 1 ELSE 0 END AS has_rog_cart,
+    MAX(CASE WHEN COALESCE(ri.rogs_ind, 0) = 1 THEN 1 ELSE 0 END) AS entered_through_rog,
+
+
+    -- Grid Cart Entries
+    COUNT(DISTINCT CASE WHEN COALESCE(ri.rogs_ind, 0) = 0 THEN c.cartsession_id END) AS grid_cart_entries,
+    CASE WHEN COUNT(DISTINCT CASE WHEN COALESCE(ri.rogs_ind, 0) = 0 THEN c.cartsession_id END) >= 1 THEN 1 ELSE 0 END AS has_grid_cart,
+
+    -- Types of Cart Entries 
+      MAX(c.first_partner_name) AS first_partner_name,
+      MAX(c.first_product_name) AS first_product_name,
+      MAX(c.last_partner_name) AS last_partner_name,
+      MAX(c.last_product_name) AS last_product_name,
+    -- Cart Info Submit Metrics
+    MAX(sc.page_1_completion) AS cart_page1_done,
+    MAX(sc.customer_info_completion) AS cart_customer_info_done,
+    MAX(sc.ssn_completion) AS cart_ssn_done,
+    MAX(rev.clicked_review_page_cta) AS cart_review_cta_click,
+
+
+    -- Credit Run Info
+    MAX(fcr.cart_credit_runs) AS cart_credit_runs,
+    MAX(fcr.cart_max_credit_score) AS cart_max_credit_score,
+    MAX(fcr.cart_ucc_pass_credit) AS cart_ucc_pass,
+    MAX(fcr.cart_providers_passed_credit) AS cart_providers_passed,
+    MAX(fcr.cart_providers_failed_credit) AS cart_providers_failed,
+    MAX(CASE WHEN fcr.first_run_provider_pass = 'pass' THEN 1 ELSE 0 END) AS cart_provider_pass,
+    MAX(credit_fail) as cart_credit_fail, 
+    MAX(fcr.first_run_credit_score) AS first_run_credit_score,
+    MAX(fcr.first_run_provider_name) AS first_run_provider_name,
+
+
+    -- Partner Qual & Volt 
+    MAX(qf.qual_fail) AS cart_qual_fail,
+    MAX(v.volt_fail) AS cart_volt_fail,
+    MAX(v.negative_list_fail_count) AS cart_negative_list_fail_cnt,
+    MAX(v.seon_fail_count) AS cart_seon_fail_cnt,
+
+    -- Pivot Interaction 
+    MAX(pcf.pivot_clicked) AS cart_pivot_clicked,
+    MAX(CASE WHEN ptt.integration_context_client_session_id IS NOT NULL THEN 1 ELSE 0 END) AS cart_pivot_triggered,
+
+    -- Cart Order Metrics
+    SUM(c.cart_order) AS cart_order,
+    COUNT(DISTINCT CASE WHEN c.cart_order = 1 THEN c.cartsession_id END) AS cart_order2,
+    SUM(c.order_gcv) AS cart_gcv,
+    MAX(c.order_term_length) AS order_term_length,
+    MAX(c.order_partner_name) AS order_partner_name,
+    MAX(c.order_product_name) AS order_product_name
+
+
+  FROM base_sessions s
+  LEFT JOIN cartsession_id_base c ON c.websession_id = s.webcontext_session_id
+  LEFT JOIN pivot_click_final pcf ON pcf.cart_session_id = c.cartsession_id
+  LEFT JOIN cart_final_credit_run fcr ON fcr.client_session_id = c.cartsession_id
+  LEFT JOIN rogs_indicator ri ON ri.session_id = s.webcontext_session_id
+  LEFT JOIN step_completions sc ON sc.cartsession_id_completions = c.cartsession_id
+  LEFT JOIN qual_final qf ON qf.client_session_id = c.cartsession_id
+  LEFT JOIN volt_fail  v  ON v.client_session_id  = c.cartsession_id
+  LEFT JOIN pivot_triggers_two_alt ptt ON ptt.integration_context_client_session_id = c.cartsession_id
+  LEFT JOIN review_page rev ON rev.cartsession_id_review = c.cartsession_id
+  GROUP BY s.webcontext_session_id
+)
+
+
+
+-- =====================================================
+-- ==============  3. Phone Funnel Section  =============
+-- =====================================================
+, call_orders AS (
+ SELECT o.call_id,
+   max(o.mover_switcher) order_mover_switcher,
+   SUM(o.predicted_activation_rate*o.undiscounted_gcv) est_gcv,
+   MAX(product_name) product_name,
+   MAX(partner_name) partner_name,
+   MAX(o.term) term_length,
+   count(distinct o.order_id) AS phone_order
+ FROM energy_prod.energy.v_orders o
+ CROSS JOIN cte_variables var
+ WHERE o.order_date_est BETWEEN var.start_date AND var.end_date
+   --AND o.tenant_id IN ('ffc8ff8a-1975-4ec4-8d59-900718adb53d', '4b27d1c6-e19e-4cc0-add3-a44b9b4a4023')
+   AND o.order_type = 'Phone'
+ GROUP BY o.call_id
+)
+
+
+, phones_call_id_base AS (
+ SELECT c.call_id
+ , c.web_session_id
+ , c.mover_switcher call_mover_switcher
+ , c.talk_time_minutes
+ , c.ib_gross_ind
+ , c.ib_queue_ind
+ , c.abandon_ind
+ , c.ibs_net_ind
+ , c.ivr_profile_name
+ , c.spanish_ind
+ , c.call_lease
+ FROM energy_prod.energy.v_calls c
+ CROSS JOIN cte_variables var
+ WHERE c.call_date_est BETWEEN var.start_date AND var.end_date
+   and c.web_session_id is not null
+   --AND c.tenant_id IN ('ffc8ff8a-1975-4ec4-8d59-900718adb53d', '4b27d1c6-e19e-4cc0-add3-a44b9b4a4023')
+)
+
+
+-- Session level aggregation for phone funnel
+, phone_session_agg AS (
+ SELECT
+     s.webcontext_session_id
+   , MAX(NVL(p.call_mover_switcher, co.order_mover_switcher)) AS call_mover_switcher
+   , COUNT(DISTINCT p.call_id)                                 AS call_count
+   , MAX(CASE WHEN p.call_id IS NOT NULL THEN 1 ELSE 0 END)    AS has_call
+   , COUNT(DISTINCT CASE WHEN p.ib_gross_ind > 0 THEN p.call_id END) as gross_calls
+   , COUNT(DISTINCT CASE WHEN p.ib_queue_ind > 0 THEN p.call_id END) AS queue_calls
+   , COUNT(DISTINCT CASE WHEN p.ib_queue_ind > 0 AND UPPER(p.call_lease) LIKE '%FUSE-PERMA-GRID%'   THEN p.call_id END) AS queue_calls_grid
+   , COUNT(DISTINCT CASE WHEN p.ib_queue_ind > 0 AND UPPER(p.call_lease) LIKE '%FUSE-PERMA-BANNER%' THEN p.call_id END) AS queue_calls_homepage
+   , COUNT(DISTINCT CASE WHEN p.ibs_net_ind > 0 THEN p.call_id END) AS net_calls
+   , AVG(p.talk_time_minutes)                                  AS avg_talk_time
+   , MAX(p.spanish_ind)                                        AS spanish_call
+   , SUM(co.phone_order)                                       AS phone_order
+   , SUM(co.est_gcv)                                           AS phone_est_gcv
+   , MAX(co.term_length)                                       AS phone_term_length
+   -- aggregate call_lease to avoid dup rows
+   , sort_array(collect_set(upper(p.call_lease)))              AS call_leases        -- array
+   , concat_ws(', ', sort_array(collect_set(upper(p.call_lease)))) AS call_lease_list -- readable string
+ FROM base_sessions s
+ LEFT JOIN phones_call_id_base p ON p.web_session_id = s.webcontext_session_id
+ LEFT JOIN call_orders        co ON co.call_id       = p.call_id
+ GROUP BY s.webcontext_session_id
+),
+
+/* ============================================================
+   4) Initiative Identifiers
+   ============================================================ */
+lp_jo AS (
+  SELECT DISTINCT
+    d.sessionId,
+    CASE
+      WHEN CAST(d.isHoldout AS STRING) = 'true' THEN 'Holdout'
+      WHEN COALESCE(d.isHoldout, false) = false
+           AND dd.explore_exploit_holdout = 'intuitive_explore'
+        THEN 'FMP'
+      WHEN COALESCE(d.isHoldout, false) = false
+           AND dd.explore_exploit_holdout IN ('explore', 'exploit')
+        THEN 'Model'
+      ELSE 'Model'
+    END AS lp_experience
+  FROM lakehouse_production.energy.dapi_decisions d
+  LEFT JOIN energy_prod.data_science.dapi_decision_explore_exploit_classification dd
+    ON dd._id = d._id
+  WHERE d.agentId = '3313'
+    AND (d.result IN ('SUCCESS', 'FAILURE') OR d.result IS NULL)
+),
+
+grid_jo AS (
+  SELECT DISTINCT
+    d.sessionId,
+    CASE
+      WHEN CAST(d.isHoldout AS STRING) = 'true' THEN 'Holdout'
+      ELSE 'Model'
+    END AS grid_isHoldout
+  FROM lakehouse_production.energy.dapi_decisions d
+  WHERE d.agentId IN ('3378', '3401')
+    AND (
+      d.result IN ('SUCCESS', 'FAILURE')
+      OR d.result IS NULL
+      OR (
+        d.result = 'ERROR'
+        AND decision_provided_date BETWEEN '2026-02-13' AND '2026-02-18'
+      )
+    )
+),
+
+all_session_ids AS (
+  SELECT sessionId FROM lp_jo
+  UNION
+  SELECT sessionId FROM grid_jo
+),
+
+
+initiative_master AS (
+  SELECT
+    s.sessionId,
+    CASE WHEN lp.lp_experience = 'FMP' THEN 1 ELSE 0 END AS is_fmp,
+
+    CASE
+      WHEN lp.sessionId IS NOT NULL AND grid.sessionId IS NULL THEN 1
+      ELSE 0
+    END AS is_lp,
+
+    CASE
+      WHEN lp.sessionId IS NULL AND grid.sessionId IS NOT NULL THEN 1
+      ELSE 0
+    END AS is_grid,
+
+    CASE
+      WHEN lp.sessionId IS NOT NULL AND grid.sessionId IS NOT NULL THEN 1
+      ELSE 0
+    END AS grid_lp,
+
+    lp.lp_experience,
+
+    CASE
+      WHEN lp.lp_experience = 'Holdout' THEN 'Holdout'
+      WHEN grid.grid_isHoldout = 'Holdout' THEN 'Holdout'
+      ELSE 'Model'
+    END AS isHoldout
+
+  FROM all_session_ids s
+  LEFT JOIN lp_jo lp
+    ON s.sessionId = lp.sessionId
+  LEFT JOIN grid_jo grid
+    ON s.sessionId = grid.sessionId
+  WHERE NOT (
+    lp.lp_experience IS NOT NULL
+    AND grid.grid_isHoldout IS NOT NULL
+    AND lp.lp_experience = 'Holdout'
+    AND grid.grid_isHoldout <> 'Holdout'
+  )
+  AND NOT (
+    lp.lp_experience IS NOT NULL
+    AND grid.grid_isHoldout IS NOT NULL
+    AND lp.lp_experience <> 'Holdout'
+    AND grid.grid_isHoldout = 'Holdout'
+  )
+), 
+
+final AS (
+  SELECT
+    -- ===== Session Level Information (Mix Drivers) =====
+    1 as session, 
+    bs.webcontext_session_id,
+    bs.session_start_date_est,
+    bs.website,
+    bs.device_type,
+    bs.marketing_channel,
+    bs.mover_switcher, 
+    bs.landing_page_type,
+
+    -- ===== Initiative / experiment identifiers =====
+    m.is_fmp,
+    m.is_lp,
+    m.is_grid,
+    m.grid_lp,
+    m.lp_experience,
+    m.isHoldout,
+
+    -- ===== Funnel Flags =====
+    -- CART 
+    bs.zip_entry, 
+    c.has_cart,  
+    c.cart_order,
+    c.cart_page1_done,          -- Contact Info + Address Step Completed
+    c.cart_customer_info_done,  -- Customer Info Form Submitted
+    c.cart_ssn_done,            -- SSN / Credit Step Completed,
+    c.cart_gcv, 
+
+    -- PHONES 
+    CASE WHEN p.gross_calls >= 1 THEN 1 ELSE 0 END as gross_call,
+    CASE WHEN p.queue_calls >= 1 THEN 1 ELSE 0 END AS queue_call,
+    p.phone_order,   
+    p.phone_est_gcv,          
+
+    -- === Partnership Information === 
+    c.first_partner_name, 
+    c.order_partner_name, 
+
+    -- ===== Customer Quality Identifiers ==
+    c.cart_volt_fail,       
+    c.cart_credit_fail,          
+    c.cart_provider_pass,     
+    c.cart_qual_fail,           
+    c.cart_max_credit_score,
+    c.first_run_credit_score,
+    c.first_run_provider_name
+    
+  FROM base_sessions bs
+  LEFT JOIN cart_session_agg c ON bs.webcontext_session_id = c.webcontext_session_id
+  LEFT JOIN phone_session_agg p ON bs.webcontext_session_id = p.webcontext_session_id
+  LEFT JOIN initiative_master m ON bs.webcontext_session_id = m.sessionId
+)
+SELECT * FROM final 
+
