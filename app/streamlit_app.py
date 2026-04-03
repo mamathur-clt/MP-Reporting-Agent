@@ -27,6 +27,7 @@ from app.decomposition import (
     _initiative_label,
 )
 from app.narrative import generate_llm_narrative, build_chat_system_prompt, stream_chat_response
+from app.finance_data import fetch_finance_daily, fetch_plan_pacing, build_funnel_summary, render_summary_html
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -171,6 +172,36 @@ df_current["_initiative_label"] = df_current.apply(_initiative_label, axis=1)
 df_prior["_initiative_label"] = df_prior.apply(_initiative_label, axis=1)
 
 # ---------------------------------------------------------------------------
+# Performance Summary (finance source of truth — top of page)
+# ---------------------------------------------------------------------------
+try:
+    with st.spinner("Loading finance performance data…"):
+        _finance_df = fetch_finance_daily()
+        _plan_df = fetch_plan_pacing()
+
+    _summary_channels = channel_filter if channel_filter else available_channels
+    _summary_rows = build_funnel_summary(
+        _finance_df, _plan_df, _summary_channels,
+        curr_start=curr_start, curr_end=curr_end,
+        prior_start=prior_start, prior_end=prior_end,
+    )
+
+    _period_label = f"{curr_start.strftime('%-m/%-d')} – {curr_end.strftime('%-m/%-d/%y')}"
+
+    st.header("Performance Summary")
+    st.caption(
+        "Source: **Finance reporting queries** (source of truth for performance). "
+        "Session-level driver analysis below is directional and may not tie exactly."
+    )
+    st.markdown(
+        render_summary_html(_summary_rows, date.today(), period_label=_period_label),
+        unsafe_allow_html=True,
+    )
+    st.divider()
+except Exception as e:
+    st.warning(f"Finance summary unavailable: {e}")
+
+# ---------------------------------------------------------------------------
 # Section 1: KPI Summary
 # ---------------------------------------------------------------------------
 st.header(f"1. {KPIS[kpi_key].name} — Period Summary")
@@ -264,12 +295,7 @@ if not impact_current.empty:
 
 if all_bars:
     bars_df = pd.DataFrame(all_bars).sort_values("pp", ascending=True)
-    colors = []
-    for _, r in bars_df.iterrows():
-        if r["type"] == "initiative":
-            colors.append("#3498db" if r["pp"] >= 0 else "#e67e22")
-        else:
-            colors.append("#2ecc71" if r["pp"] >= 0 else "#e74c3c")
+    colors = ["#2ecc71" if r["pp"] >= 0 else "#e74c3c" for _, r in bars_df.iterrows()]
 
     fig = go.Figure(go.Bar(
         y=bars_df["label"],
@@ -286,8 +312,11 @@ if all_bars:
         title=f"Top drivers of {KPIS[kpi_key].short_name} change ({pct_change_str}, {total_pp:+.2f}pp)",
         xaxis_title="Contribution (pp)",
         xaxis=dict(zeroline=True, zerolinewidth=2, zerolinecolor="gray"),
+        yaxis=dict(
+            tickfont=dict(size=15, color="#1a1a1a", family="Arial, sans-serif"),
+        ),
         yaxis_title="",
-        height=max(400, len(bars_df) * 45),
+        height=max(480, len(bars_df) * 55),
         margin=dict(l=20, r=100),
         showlegend=False,
     )
