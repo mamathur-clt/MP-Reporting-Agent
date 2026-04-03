@@ -1,0 +1,383 @@
+-- ✅ Fix: aggregate across the *selected channel set first*, then compute rates + deltas
+-- NOTE: Map your dashboard multi-select filter to :marketing_channel (multi-value) so the query
+--       filters rows BEFORE aggregation.
+
+/* 1) Filter rows FIRST (including multi-select channels), normalize channel + perf view */
+WITH tx_filtered AS (
+  SELECT
+    tx.rpt_date AS date,
+    tx.month,
+    CASE WHEN tx.performance_view = 'Final' THEN 'Plan' ELSE tx.performance_view END AS performance_view,
+
+    -- keep the same channel normalization as your original query
+    tx.MarketingChannel as MarketingChannel,
+
+    -- keep only fields needed downstream
+    tx.impressions,
+    tx.clicks,
+    tx.sessions,
+    tx.marketing_costs,
+    tx.serp_queue_calls,
+    tx.serp_gross_calls,
+    tx.serp_abandon_calls,
+    tx.serp_net_calls,
+    tx.serp_orders,
+    tx.site_queue_calls,
+    tx.site_gross_calls,
+    tx.site_abandon_calls,
+    tx.site_net_calls,
+    tx.site_phone_orders,
+    tx.total_queue_calls,
+    tx.total_abandon_calls,
+    tx.total_net_calls, 
+    tx.phone_orders,
+    tx.cart_entries,
+    tx.cart_orders,
+    tx.total_orders,
+    tx.phone_revenue,
+    tx.cart_revenue,
+    tx.revenue,
+    tx.sales_center_cost,
+    tx.opex
+  FROM energy_prod.energy.rpt_texas_daily_pacing tx
+  WHERE tx.performance_view IN ('Pacing','Final','Internal Plan')
+
+    -- IMPORTANT: parentheses fix (your original AND/OR precedence was not what you intended)
+
+
+    AND (tx.rpt_date = last_day(tx.rpt_date) OR tx.rpt_date = current_date - 1)
+    AND tx.rpt_date >= '2026-01-01'
+
+    -- ✅ Dashboard multi-select filter should bind here (values are the *normalized* channel names)
+    AND array_contains(:marketing_channel, tx.MarketingChannel)
+),
+
+/* 2) Aggregate numerators/denominators at the desired grain (NO channel in the GROUP BY) */
+agg AS (
+  SELECT
+    date,
+    month,
+    performance_view,
+
+    -- paid-only measures (matches your original logic)
+    SUM(CASE WHEN MarketingChannel IN ('Paid Search','PMAX','Social') THEN impressions ELSE 0 END) AS impressions_paid,
+    SUM(CASE WHEN MarketingChannel IN ('Paid Search','PMAX','Social') THEN clicks      ELSE 0 END) AS clicks_paid,
+
+    -- totals used as denominators in your original rates
+    SUM(clicks)   AS clicks_total,
+    SUM(sessions) AS sessions,
+
+    -- interactions (same logic as original)
+    SUM(CASE WHEN MarketingChannel IN ('PMAX','Paid Search', 'Social') THEN clicks   ELSE 0 END)
+      + SUM(CASE WHEN MarketingChannel NOT IN ('PMAX','Paid Search', 'Social') THEN sessions ELSE 0 END) AS interactions,
+
+    -- cost numerator for CPC (same logic as original)
+    SUM(CASE WHEN MarketingChannel <> 'Affiliate' THEN marketing_costs ELSE 0 END) AS marketing_costs_non_affiliate,
+
+    -- SERP components
+    SUM(serp_queue_calls)   AS serp_queue_calls,
+    SUM(serp_gross_calls)   AS serp_gross_calls,
+    SUM(serp_abandon_calls) AS serp_abandon_calls,
+    SUM(serp_net_calls)     AS serp_net_calls,
+    SUM(serp_orders)        AS serp_orders,
+
+    -- SITE components
+    SUM(site_queue_calls)   AS site_queue_calls,
+    SUM(site_gross_calls)   AS site_gross_calls,
+    SUM(site_abandon_calls) AS site_abandon_calls,
+    SUM(site_net_calls)     AS site_net_calls,
+    SUM(site_phone_orders)  AS site_phone_orders,
+
+    -- TOTAL call components
+    SUM(total_queue_calls)   AS total_queue_calls,
+    SUM(total_abandon_calls) AS total_abandon_calls,
+    SUM(total_net_calls)     AS total_net_calls,
+    SUM(phone_orders)        AS phone_orders,
+
+    -- Cart components
+    SUM(cart_entries) AS cart_entries,
+    SUM(cart_orders)  AS cart_orders,
+
+    -- Order / revenue totals
+    SUM(total_orders)   AS total_orders,
+    SUM(phone_revenue)  AS phone_revenue,
+    SUM(cart_revenue)   AS cart_revenue,
+
+    -- Core/expansion (same buckets as your original query)
+    SUM(CASE WHEN MarketingChannel IN ('Paid Search','PMAX','Organic','Direct','Other','Internal','Outbound','Referral')
+             THEN revenue ELSE 0 END) AS core_revenue,
+    SUM(CASE WHEN MarketingChannel IN ('Social','Display','Affiliate','SMS','Email')
+             THEN revenue ELSE 0 END) AS expansion_revenue,
+
+    SUM(CASE WHEN MarketingChannel IN ('Paid Search','PMAX','Organic','Direct','Other','Outbound','Cross Sell','Referral')
+             THEN marketing_costs ELSE 0 END) AS core_marketing_cost,
+    SUM(CASE WHEN MarketingChannel IN ('Social','Display','Affiliate','SMS','Email')
+             THEN marketing_costs ELSE 0 END) AS expansion_marketing_cost,
+
+    COALESCE(SUM(sales_center_cost),0) AS scc,
+
+    SUM(CASE WHEN MarketingChannel IN ('Paid Search','PMAX','Organic','Direct','Other','Internal','Outbound','Referral')
+             THEN revenue ELSE 0 END)
+      - SUM(CASE WHEN MarketingChannel IN ('Paid Search','PMAX','Organic','Direct','Other','Internal','Outbound','Referral')
+                 THEN marketing_costs ELSE 0 END) AS core_cm,
+
+    SUM(CASE WHEN MarketingChannel IN ('Social','Display','Affiliate','SMS','Email')
+             THEN revenue ELSE 0 END)
+      - SUM(CASE WHEN MarketingChannel IN ('Social','Display','Affiliate','SMS','Email')
+                 THEN marketing_costs ELSE 0 END) AS expansion_cm,
+
+    SUM(revenue)          AS total_revenue,
+    SUM(marketing_costs)  AS total_marketing_costs,
+    SUM(revenue) - SUM(marketing_costs) - COALESCE(SUM(sales_center_cost),0) AS total_cm,
+
+    SUM(opex) AS opex,
+    (SUM(revenue) - SUM(marketing_costs) - COALESCE(SUM(sales_center_cost),0)) - SUM(opex) AS ebitda,
+
+    -- denom for interaction_yield (same as original)
+    SUM(CASE WHEN MarketingChannel IN ('PMAX','Paid Search','Social') THEN clicks ELSE sessions END) AS interaction_yield_denom
+
+  FROM tx_filtered
+  GROUP BY 1,2,3
+),
+
+/* 3) Compute final metrics from aggregated totals (rates recomputed correctly) */
+cte_base AS (
+  SELECT
+    date,
+    month,
+    performance_view,
+    'Selected Channels' AS MarketingChannel,
+
+    impressions_paid AS impressions,
+    clicks_paid      AS clicks,
+    sessions,
+    interactions,
+
+    clicks_paid * 1.0 / NULLIF(impressions_paid,0) AS ctr,
+    marketing_costs_non_affiliate * 1.0 / NULLIF(clicks_total,0) AS cpc,
+
+    -- SERP (order matches your original schema)
+    serp_queue_calls * 1.0 / NULLIF(clicks_total,0) AS serp_rr,
+    serp_queue_calls * 1.0 / NULLIF(serp_gross_calls,0) AS serp_q2g,
+    serp_queue_calls,
+    serp_abandon_calls * 1.0 / NULLIF(serp_queue_calls,0) AS serp_abandon_rate,
+    serp_abandon_calls,
+    serp_net_calls,
+    serp_orders * 1.0 / NULLIF(serp_queue_calls,0) AS serp_conversion_rate,
+    serp_orders,
+
+    -- SITE
+    site_queue_calls * 1.0 / NULLIF(sessions,0) AS site_rr,
+    site_queue_calls * 1.0 / NULLIF(site_gross_calls,0) AS site_q2g,
+    site_queue_calls,
+    site_abandon_calls * 1.0 / NULLIF(site_queue_calls,0) AS site_abandon_rate,
+    site_abandon_calls,
+    site_net_calls,
+    site_phone_orders * 1.0 / NULLIF(site_queue_calls,0) AS site_conversion_rate, 
+    site_phone_orders,
+
+    -- TOTAL
+    total_queue_calls,
+    total_abandon_calls * 1.0 / NULLIF(total_queue_calls,0) AS total_abandon_rate,
+    total_abandon_calls,
+    total_net_calls,
+    phone_orders * 1.0 / NULLIF(total_net_calls,0) AS total_net_conversion,
+    phone_orders,
+
+    -- CART
+    cart_entries * 1.0 / NULLIF(sessions,0) AS cart_rr,
+    cart_entries,
+    cart_orders * 1.0 / NULLIF(cart_entries,0) AS cart_conversion_rate,
+    cart_orders,
+
+    -- Orders / VC / yield
+    total_orders,
+    site_phone_orders * 1.0 / NULLIF(sessions,0) AS phone_vc,
+    cart_orders * 1.0 / NULLIF(sessions,0)       AS cart_vc,
+    (total_orders - serp_orders) * 1.0 / NULLIF(sessions,0) AS total_vc,
+    total_orders * 1.0 / NULLIF(interaction_yield_denom,0)  AS interaction_yield,
+
+    -- Revenue / value per order
+    phone_revenue,
+    cart_revenue,
+    phone_revenue * 1.0 / NULLIF(phone_orders,0) AS phone_gcv_order,
+    cart_revenue  * 1.0 / NULLIF(cart_orders,0)  AS cart_gcv_order,
+
+    -- Core / expansion
+    core_revenue,
+    expansion_revenue,
+    core_marketing_cost,
+    expansion_marketing_cost,
+    scc,
+    core_cm,
+    expansion_cm,
+
+    -- Totals
+    total_revenue,
+    total_marketing_costs,
+    total_cm,
+    opex,
+    ebitda
+  FROM agg
+),
+
+/* 4) Deltas computed from aggregated totals (correct for multi-channel selection) */
+cte_delta_vs_plan AS (
+  SELECT
+    p.date,
+    p.month,
+    'vs_plan' AS performance_view,
+    p.MarketingChannel,
+
+    (p.impressions / NULLIF(pl.impressions,0)) - 1 AS impressions,
+    (p.clicks      / NULLIF(pl.clicks,0))      - 1 AS clicks,
+    (p.sessions    / NULLIF(pl.sessions,0))    - 1 AS sessions,
+    (p.interactions/ NULLIF(pl.interactions,0))- 1 AS interactions,
+    (p.ctr / NULLIF(pl.ctr,0)) - 1 AS ctr,
+    (p.cpc / NULLIF(pl.cpc,0)) - 1 AS cpc,
+
+    (p.serp_rr / NULLIF(pl.serp_rr,0)) - 1 AS serp_rr,
+    (p.serp_q2g / NULLIF(pl.serp_q2g,0)) - 1 AS serp_q2g,
+    (p.serp_queue_calls / NULLIF(pl.serp_queue_calls,0)) - 1 AS serp_queue_calls,
+    (p.serp_abandon_rate / NULLIF(pl.serp_abandon_rate,0)) - 1 AS serp_abandon_rate,
+    (p.serp_abandon_calls / NULLIF(pl.serp_abandon_calls,0)) - 1 AS serp_abandon_calls,
+    (p.serp_net_calls / NULLIF(pl.serp_net_calls,0)) - 1 AS serp_net_calls,
+    (p.serp_conversion_rate / NULLIF(pl.serp_conversion_rate,0)) - 1 AS serp_conversion_rate,
+    (p.serp_orders / NULLIF(pl.serp_orders,0)) - 1 AS serp_orders,
+
+    (p.site_rr / NULLIF(pl.site_rr,0)) - 1 AS site_rr,
+    (p.site_q2g / NULLIF(pl.site_q2g,0)) - 1 AS site_q2g,
+    (p.site_queue_calls / NULLIF(pl.site_queue_calls,0)) - 1 AS site_queue_calls,
+    (p.site_abandon_rate / NULLIF(pl.site_abandon_rate,0)) - 1 AS site_abandon_rate,
+    (p.site_abandon_calls / NULLIF(pl.site_abandon_calls,0)) - 1 AS site_abandon_calls,
+    (p.site_net_calls / NULLIF(pl.site_net_calls,0)) - 1 AS site_net_calls,
+    (p.site_conversion_rate / NULLIF(pl.site_conversion_rate,0)) - 1 AS site_conversion_rate,
+    (p.site_phone_orders / NULLIF(pl.site_phone_orders,0)) - 1 AS site_phone_orders,
+
+    (p.total_queue_calls / NULLIF(pl.total_queue_calls,0)) - 1 AS total_queue_calls,
+    (p.total_abandon_rate / NULLIF(pl.total_abandon_rate,0)) - 1 AS total_abandon_rate,
+    (p.total_abandon_calls / NULLIF(pl.total_abandon_calls,0)) - 1 AS total_abandon_calls,
+    (p.total_net_calls / NULLIF(pl.total_net_calls,0)) - 1 AS total_net_calls,
+    (p.total_net_conversion / NULLIF(pl.total_net_conversion,0)) - 1 AS total_net_conversion,
+    (p.phone_orders / NULLIF(pl.phone_orders,0)) - 1 AS phone_orders,
+
+    (p.cart_rr / NULLIF(pl.cart_rr,0)) - 1 AS cart_rr,
+    (p.cart_entries / NULLIF(pl.cart_entries,0)) - 1 AS cart_entries,
+    (p.cart_conversion_rate / NULLIF(pl.cart_conversion_rate,0)) - 1 AS cart_conversion_rate,
+    (p.cart_orders / NULLIF(pl.cart_orders,0)) - 1 AS cart_orders,
+
+    (p.total_orders / NULLIF(pl.total_orders,0)) - 1 AS total_orders,
+    (p.phone_vc / NULLIF(pl.phone_vc,0)) - 1 AS phone_vc,
+    (p.cart_vc / NULLIF(pl.cart_vc,0)) - 1 AS cart_vc,
+    (p.total_vc / NULLIF(pl.total_vc,0)) - 1 AS total_vc,
+    (p.interaction_yield / NULLIF(pl.interaction_yield,0)) - 1 AS interaction_yield,
+
+    (p.phone_revenue / NULLIF(pl.phone_revenue,0)) - 1 AS phone_revenue,
+    (p.cart_revenue  / NULLIF(pl.cart_revenue,0))  - 1 AS cart_revenue,
+    (p.phone_gcv_order / NULLIF(pl.phone_gcv_order,0)) - 1 AS phone_gcv_order,
+    (p.cart_gcv_order  / NULLIF(pl.cart_gcv_order,0))  - 1 AS cart_gcv_order,
+
+    (p.core_revenue / NULLIF(pl.core_revenue,0)) - 1 AS core_revenue,
+    (p.expansion_revenue / NULLIF(pl.expansion_revenue,0)) - 1 AS expansion_revenue,
+    (p.core_marketing_cost / NULLIF(pl.core_marketing_cost,0)) - 1 AS core_marketing_cost,
+    (p.expansion_marketing_cost / NULLIF(pl.expansion_marketing_cost,0)) - 1 AS expansion_marketing_cost,
+    (p.scc / NULLIF(pl.scc,0)) - 1 AS scc,
+    (p.core_cm / NULLIF(pl.core_cm,0)) - 1 AS core_cm,
+    (p.expansion_cm / NULLIF(pl.expansion_cm,0)) - 1 AS expansion_cm,
+
+    (p.total_revenue / NULLIF(pl.total_revenue,0)) - 1 AS total_revenue,
+    (p.total_marketing_costs / NULLIF(pl.total_marketing_costs,0)) - 1 AS total_marketing_costs,
+    (p.total_cm / NULLIF(pl.total_cm,0)) - 1 AS total_cm,
+    (p.opex / NULLIF(pl.opex,0)) - 1 AS opex,
+    (p.ebitda / NULLIF(pl.ebitda,0)) - 1 AS ebitda
+
+  FROM cte_base p
+  LEFT JOIN cte_base pl
+    ON pl.date = p.date
+   AND pl.month = p.month
+   AND pl.performance_view = 'Plan'
+  WHERE p.performance_view = 'Pacing'
+),
+
+cte_delta_vs_internal AS (
+  SELECT
+    p.date,
+    p.month,
+    'vs_internal' AS performance_view,
+    p.MarketingChannel,
+
+    (p.impressions / NULLIF(i.impressions,0)) - 1 AS impressions,
+    (p.clicks      / NULLIF(i.clicks,0))      - 1 AS clicks,
+    (p.sessions    / NULLIF(i.sessions,0))    - 1 AS sessions,
+    (p.interactions/ NULLIF(i.interactions,0))- 1 AS interactions,
+    (p.ctr / NULLIF(i.ctr,0)) - 1 AS ctr,
+    (p.cpc / NULLIF(i.cpc,0)) - 1 AS cpc,
+
+    (p.serp_rr / NULLIF(i.serp_rr,0)) - 1 AS serp_rr,
+    (p.serp_q2g / NULLIF(i.serp_q2g,0)) - 1 AS serp_q2g,
+    (p.serp_queue_calls / NULLIF(i.serp_queue_calls,0)) - 1 AS serp_queue_calls,
+    (p.serp_abandon_rate / NULLIF(i.serp_abandon_rate,0)) - 1 AS serp_abandon_rate,
+    (p.serp_abandon_calls / NULLIF(i.serp_abandon_calls,0)) - 1 AS serp_abandon_calls,
+    (p.serp_net_calls / NULLIF(i.serp_net_calls,0)) - 1 AS serp_net_calls,
+    (p.serp_conversion_rate / NULLIF(i.serp_conversion_rate,0)) - 1 AS serp_conversion_rate,
+    (p.serp_orders / NULLIF(i.serp_orders,0)) - 1 AS serp_orders,
+
+    (p.site_rr / NULLIF(i.site_rr,0)) - 1 AS site_rr,
+    (p.site_q2g / NULLIF(i.site_q2g,0)) - 1 AS site_q2g,
+    (p.site_queue_calls / NULLIF(i.site_queue_calls,0)) - 1 AS site_queue_calls,
+    (p.site_abandon_rate / NULLIF(i.site_abandon_rate,0)) - 1 AS site_abandon_rate,
+    (p.site_abandon_calls / NULLIF(i.site_abandon_calls,0)) - 1 AS site_abandon_calls,
+    (p.site_net_calls / NULLIF(i.site_net_calls,0)) - 1 AS site_net_calls,
+    (p.site_conversion_rate / NULLIF(i.site_conversion_rate,0)) - 1 AS site_conversion_rate,
+    (p.site_phone_orders / NULLIF(i.site_phone_orders,0)) - 1 AS site_phone_orders,
+
+    (p.total_queue_calls / NULLIF(i.total_queue_calls,0)) - 1 AS total_queue_calls,
+    (p.total_abandon_rate / NULLIF(i.total_abandon_rate,0)) - 1 AS total_abandon_rate,
+    (p.total_abandon_calls / NULLIF(i.total_abandon_calls,0)) - 1 AS total_abandon_calls,
+    (p.total_net_calls / NULLIF(i.total_net_calls,0)) - 1 AS total_net_calls,
+    (p.total_net_conversion / NULLIF(i.total_net_conversion,0)) - 1 AS total_net_conversion,
+    (p.phone_orders / NULLIF(i.phone_orders,0)) - 1 AS phone_orders,
+
+    (p.cart_rr / NULLIF(i.cart_rr,0)) - 1 AS cart_rr,
+    (p.cart_entries / NULLIF(i.cart_entries,0)) - 1 AS cart_entries,
+    (p.cart_conversion_rate / NULLIF(i.cart_conversion_rate,0)) - 1 AS cart_conversion_rate,
+    (p.cart_orders / NULLIF(i.cart_orders,0)) - 1 AS cart_orders,
+
+    (p.total_orders / NULLIF(i.total_orders,0)) - 1 AS total_orders,
+    (p.phone_vc / NULLIF(i.phone_vc,0)) - 1 AS phone_vc,
+    (p.cart_vc / NULLIF(i.cart_vc,0)) - 1 AS cart_vc,
+    (p.total_vc / NULLIF(i.total_vc,0)) - 1 AS total_vc,
+    (p.interaction_yield / NULLIF(i.interaction_yield,0)) - 1 AS interaction_yield,
+
+    (p.phone_revenue / NULLIF(i.phone_revenue,0)) - 1 AS phone_revenue,
+    (p.cart_revenue  / NULLIF(i.cart_revenue,0))  - 1 AS cart_revenue,
+    (p.phone_gcv_order / NULLIF(i.phone_gcv_order,0)) - 1 AS phone_gcv_order,
+    (p.cart_gcv_order  / NULLIF(i.cart_gcv_order,0))  - 1 AS cart_gcv_order,
+
+    (p.core_revenue / NULLIF(i.core_revenue,0)) - 1 AS core_revenue,
+    (p.expansion_revenue / NULLIF(i.expansion_revenue,0)) - 1 AS expansion_revenue,
+    (p.core_marketing_cost / NULLIF(i.core_marketing_cost,0)) - 1 AS core_marketing_cost,
+    (p.expansion_marketing_cost / NULLIF(i.expansion_marketing_cost,0)) - 1 AS expansion_marketing_cost,
+    (p.scc / NULLIF(i.scc,0)) - 1 AS scc,
+    (p.core_cm / NULLIF(i.core_cm,0)) - 1 AS core_cm,
+    (p.expansion_cm / NULLIF(i.expansion_cm,0)) - 1 AS expansion_cm,
+
+    (p.total_revenue / NULLIF(i.total_revenue,0)) - 1 AS total_revenue,
+    (p.total_marketing_costs / NULLIF(i.total_marketing_costs,0)) - 1 AS total_marketing_costs,
+    (p.total_cm / NULLIF(i.total_cm,0)) - 1 AS total_cm,
+    (p.opex / NULLIF(i.opex,0)) - 1 AS opex,
+    (p.ebitda / NULLIF(i.ebitda,0)) - 1 AS ebitda
+
+  FROM cte_base p
+  LEFT JOIN cte_base i
+    ON i.date = p.date
+   AND i.month = p.month
+   AND i.performance_view = 'Internal Plan'
+  WHERE p.performance_view = 'Pacing'
+)
+
+SELECT * FROM cte_base
+UNION ALL
+SELECT * FROM cte_delta_vs_plan
+UNION ALL
+SELECT * FROM cte_delta_vs_internal;

@@ -1,0 +1,599 @@
+WITH
+   cte_variables AS (
+       SELECT
+           DATE('2026-01-01') AS start_date,
+           current_date AS end_date,
+           -- CAST(current_date-1 AS DATE) AS end_date,
+           'Yes' AS social_ind
+   ),
+
+
+   cte_pacing_weights AS (
+       SELECT TO_DATE(date, 'M/d/yy') AS pacing_date,
+              MAX(CAST(REPLACE(pacing, '%', '') AS DECIMAL(10, 2)))/100 AS pacing_weight
+       FROM energy_prod.fivetran_finance.pacing_weights
+       WHERE TO_DATE(date, 'M/d/yy') BETWEEN DATE_TRUNC('MM', CURRENT_DATE()) AND DATE_SUB(CURRENT_DATE(), 1)
+       GROUP BY TO_DATE(date, 'M/d/yy')
+       ORDER BY TO_DATE(date, 'M/d/yy') DESC
+   ),
+
+
+   cte_scc AS (
+       SELECT
+           t.month::DATE AS month,
+           SUM(t.sales_center_cost) / SUM(total_queue_calls) AS scc_per_call
+       FROM energy_prod.fivetran_finance.q_2_2025_texas_reforecast t
+       GROUP BY 1
+   ),
+
+
+   cte_permalease AS (
+       SELECT
+           COALESCE(
+               DATE(DATE_ADD(DAY, -1, LEAD(start_date, 1) OVER (PARTITION BY channel, permalease ORDER BY start_date))),
+               DATE('2099-01-01')
+           ) AS end_date,
+           *
+       FROM (
+           SELECT
+               channel,
+               permalease,
+               energy_prod.energy.f_convert_string_to_date(REPLACE(start_date, '-', '/')) AS start_date,
+               ROW_NUMBER() OVER (
+                   PARTITION BY pl.start_date, pl.channel, pl.permalease
+                   ORDER BY _fivetran_synced
+               ) AS rn
+           FROM energy_prod.fivetran_finance.permalease pl
+       ) z
+       WHERE z.rn = 1
+   ),
+
+
+
+
+   cte_outbound_order_reclass AS (
+     WITH prior AS (
+       SELECT
+         o.order_id,
+         rc.call_id AS prev_call_id,
+         rc.call_ts AS prev_call_ts,
+         CASE
+           WHEN (rc.traffic_source IN ('Email') OR s.traffic_source IN ('Email'))
+             OR (rc.traffic_channel IN ('Email') OR s.traffic_channel IN ('Email'))
+             OR pl.channel = 'Email' THEN 'Email'
+           WHEN (rc.traffic_source IN ('SMS') OR s.traffic_source IN ('SMS'))
+             OR (rc.traffic_channel IN ('SMS') OR s.traffic_channel IN ('SMS'))
+             OR pl.channel = 'SMS' THEN 'SMS'
+           WHEN rc.campaign ILIKE '%^Display%' THEN 'Display'
+           WHEN rc.campaign ILIKE '%pMax%'     THEN 'pMax'
+           WHEN (rc.campaign ILIKE '%a:CTXP%' OR rc.campaign ILIKE '%a:SOE%' OR rc.campaign ILIKE '%a:TXER%' OR rc.campaign ILIKE '%a:CHOO%')
+              OR ((rc.traffic_source = 'Paid' AND rc.traffic_channel = 'Search')
+               OR  (s.traffic_source  = 'Paid' AND s.traffic_channel  = 'Search'))
+              OR pl.channel = 'Fallback' THEN 'Paid Search'
+           WHEN rc.traffic_source IN ('Affiliate','Affliate') OR s.traffic_source IN ('Affiliate','Affliate') OR pl.channel = 'Affiliate' THEN 'Affiliate'
+           WHEN rc.traffic_source IN ('Organic') AND rc.traffic_channel IN ('Direct','Search') AND COALESCE(rc.permalease_call_ind,0) = 0 THEN 'Organic'
+           WHEN rc.traffic_source IN ('Direct')  AND rc.traffic_channel IN ('Direct','Search') AND COALESCE(rc.permalease_call_ind,0) = 0 THEN 'Direct'
+           WHEN (rc.traffic_source IN ('Organic','Direct') OR s.traffic_source IN ('Organic','Direct'))
+             AND (rc.traffic_channel = 'Referral' OR s.traffic_channel = 'Referral')
+             AND COALESCE(rc.permalease_call_ind,0) = 0 THEN 'Referral'
+           WHEN rc.traffic_channel = 'Social' AND COALESCE(rc.permalease_call_ind,0) = 0 THEN 'Social'
+           ELSE 'Other'
+         END AS rc_marketing_channel,
+         CASE
+           WHEN rc.web_session_id IS NULL
+               AND (
+                    pl.channel = 'Fallback'
+                 OR rc.campaign ILIKE '%pMax%'
+                 OR (rc.campaign ILIKE '%a:CTXP%' OR rc.campaign ILIKE '%a:SOE%' OR rc.campaign ILIKE '%a:TXER%' OR rc.campaign ILIKE '%a:CHOO%')
+                 OR (rc.traffic_source = 'Paid' AND rc.traffic_channel = 'Search')
+                 OR (s.traffic_source  = 'Paid' AND s.traffic_channel  = 'Search')
+               )
+             THEN 1 ELSE 0
+               END AS rc_serp_order,
+         ROW_NUMBER() OVER (PARTITION BY o.order_id ORDER BY rc.call_ts DESC, rc.call_id DESC) AS rnk
+       FROM energy_prod.energy.v_orders o
+       CROSS JOIN cte_variables v
+       LEFT JOIN energy_prod.energy.v_calls c
+         ON c.call_id = o.call_id
+       JOIN energy_prod.energy.v_calls rc
+         ON rc.remote_number_call = c.remote_number_call
+        AND rc.call_ts            <  c.call_ts
+        AND rc.call_ts            >= c.call_ts - INTERVAL 30 DAYS
+       LEFT JOIN energy_prod.energy.v_sessions s
+         ON s.webcontext_session_id = rc.web_session_id
+       LEFT JOIN cte_permalease pl
+         ON pl.permalease = rc.dnis
+        AND rc.call_date_est BETWEEN pl.start_date AND pl.end_date
+       WHERE c.call_direction <> 'INBOUND'
+         AND o.order_date_est BETWEEN v.start_date AND v.end_date
+         AND o.txorder_ind = 1
+         AND COALESCE(o.company_id,25) = 25
+     )
+    
+    
+     SELECT
+       order_id,
+       CASE
+         WHEN rc_marketing_channel IN ('Email','SMS','Display','pMax','Paid Search','Organic','Affiliate','Social','Direct','Referral','Internal')
+           THEN rc_marketing_channel
+         ELSE NULL
+       END AS reclass_channel,
+       rc_serp_order
+     FROM prior
+     WHERE rnk = 1
+   )
+  
+
+
+,
+
+
+   cte_carts AS (
+       SELECT
+           ct.cartsession_start_date_est AS rpt_date,
+           CASE
+               WHEN ct.traffic_source IN ('Email') OR ct.traffic_channel IN ('Email') THEN 'Email'
+               WHEN ct.traffic_source IN ('SMS')  OR ct.traffic_channel IN ('SMS')  THEN 'SMS'
+               WHEN ct.campaign ILIKE '%pMax%'    THEN 'pMax'
+               WHEN ct.campaign ILIKE '%^Display%' THEN 'Display'
+               WHEN (ct.campaign ILIKE '%a:CTXP%' OR ct.campaign ILIKE '%a:SOE%' OR ct.campaign ILIKE '%a:TXER%' OR ct.campaign ILIKE '%a:CHOO%')
+                 OR (ct.traffic_source = 'Paid' AND ct.traffic_channel = 'Search') THEN 'Paid Search'
+               WHEN (s.first_page_referrer ILIKE '%chatgpt%' OR s.first_page_url ILIKE '%chatgpt%') or
+                   s.first_page_referrer ILIKE '%copilot.microsoft%' or
+                   s.first_page_referrer ILIKE '%perplexity%' or
+                   s.first_page_referrer ILIKE '%gemini.google%' or 
+                   s.first_page_referrer ILIKE '%claude%' or
+                   s.first_page_referrer ILIKE '%andisearch%' or
+                   s.first_page_referrer ILIKE '%bagoodex%' or
+                   s.first_page_referrer ILIKE '%brave%' or
+                   s.first_page_referrer ILIKE '%grok%' THEN 'AI Search'
+               WHEN ct.traffic_source IN ('Organic') AND ct.traffic_channel IN ('Direct','Search') THEN 'Organic'
+               WHEN ct.traffic_source IN ('Direct')  AND ct.traffic_channel IN ('Direct','Search') THEN 'Direct'
+               WHEN ct.traffic_source IN ('Organic','Direct') AND ct.traffic_channel IN ('Referral') THEN 'Referral'
+               WHEN ct.traffic_source IN ('Affiliate','Affliate') THEN 'Affiliate'
+               WHEN ct.traffic_channel = 'Social' THEN 'Social'
+               ELSE 'Other'
+           END AS MarketingChannel,
+           COUNT(DISTINCT ct.websession_id) AS CartEntries
+       FROM energy_prod.energy.v_carts ct
+       JOIN cte_variables v
+         ON ct.cartsession_start_date_est BETWEEN v.start_date AND v.end_date
+       LEFT JOIN energy_prod.energy.v_sessions s on s.webcontext_session_id = ct.websession_id
+       WHERE ct.txmarketplace_ind = 1
+         AND ct.bot_ip_ind = 0
+         AND ct.is_internal_ip = FALSE
+         AND COALESCE(ct.company_id, 25) = 25
+       GROUP BY 1,2
+   ),
+
+
+   cte_sessions AS (
+       SELECT
+           s.session_start_date_est AS rpt_date,
+           CASE
+               WHEN s.campaign ILIKE '%^Display%' THEN 'Display'
+               WHEN s.traffic_source = 'Paid' AND s.traffic_channel = 'Search' THEN 'Paid Search'
+               WHEN s.traffic_source = 'Paid' AND s.traffic_channel = 'Pmax'   THEN 'pMax'
+               WHEN (s.first_page_referrer ILIKE '%chatgpt%' OR s.first_page_url ILIKE '%chatgpt%') or
+                   s.first_page_referrer ILIKE '%copilot.microsoft%' or
+                   s.first_page_referrer ILIKE '%perplexity%' or
+                   s.first_page_referrer ILIKE '%gemini.google%' or 
+                   s.first_page_referrer ILIKE '%claude%' or
+                   s.first_page_referrer ILIKE '%andisearch%' or
+                   s.first_page_referrer ILIKE '%bagoodex%' or
+                   s.first_page_referrer ILIKE '%brave%' or
+                   s.first_page_referrer ILIKE '%grok%' THEN 'AI Search'
+               WHEN s.traffic_source IN ('Direct')  AND s.traffic_channel IN ('Direct','Search') AND s.transactional_ind = 1 THEN 'Direct'
+               WHEN s.traffic_source IN ('Organic') AND s.traffic_channel IN ('Direct','Search') AND s.transactional_ind = 1 THEN 'Organic'
+               WHEN s.traffic_source IN ('Organic','Direct') AND s.traffic_channel IN ('Referral') AND s.transactional_ind = 1 THEN 'Referral'
+               WHEN s.traffic_source IN ('Affiliate','Affliate') THEN 'Affiliate'
+               WHEN s.traffic_source IN ('Email') OR s.traffic_channel IN ('Email') THEN 'Email'
+               WHEN s.traffic_source IN ('SMS')   OR s.traffic_channel IN ('SMS')   THEN 'SMS'
+               WHEN s.traffic_channel = 'Social' THEN 'Social'
+               WHEN s.traffic_channel = 'Internal' OR s.traffic_source = 'Internal' THEN 'Internal'
+               ELSE 'Other'
+           END AS MarketingChannel,
+           COUNT(DISTINCT s.webcontext_session_id) AS Sessions,
+           COUNT(DISTINCT CASE WHEN s.entered_zip IS NOT NULL THEN s.webcontext_session_id END) AS ZipEntries
+       FROM energy_prod.energy.v_sessions s
+       JOIN cte_variables v
+         ON s.session_start_date_est BETWEEN v.start_date AND v.end_date
+       WHERE s.bot_ip_ind = 0
+         AND s.is_bot = FALSE
+         AND s.is_internal_ip = FALSE
+         AND COALESCE(s.company_id, 25) = 25
+         AND s.first_page_url NOT LIKE '%solar-energy%'
+         AND s.first_page_url NOT LIKE '%resources%'
+         AND (s.non_texas_ind = 0 OR s.campaign ILIKE '%a:SOE%')
+         AND (s.category IS NULL OR s.category != 'Non-Texas')
+         AND (LOWER(s.region) = 'tx' OR s.first_page_url ILIKE '%texas%' OR s.site_name NOT ILIKE '%chooseenergy%')
+       GROUP BY 1,2
+   ),
+
+
+   cte_calls AS (
+       SELECT
+           c.call_date_est AS rpt_date,
+           CASE
+               WHEN c.traffic_source IN ('Email') OR c.traffic_channel IN ('Email') OR pl.channel IN ('Email') THEN 'Email'
+               WHEN c.traffic_source IN ('SMS')  OR c.traffic_channel IN ('SMS')  OR pl.channel IN ('SMS')   THEN 'SMS'
+               WHEN c.campaign ILIKE '%^Display%' THEN 'Display'
+               WHEN c.campaign ILIKE '%pMax%'     THEN 'pMax'
+               WHEN (c.campaign ILIKE '%a:CTXP%' OR c.campaign ILIKE '%a:SOE%' OR c.campaign ILIKE '%a:TXER%' OR c.campaign ILIKE '%a:CHOO%')
+                 OR (c.traffic_source = 'Paid' AND c.traffic_channel = 'Search')
+                 OR pl.channel = 'Fallback' THEN 'Paid Search'
+               WHEN c.traffic_source IN ('Affiliate','Affliate') OR pl.channel IN ('Affiliate') THEN 'Affiliate'
+               WHEN (s.first_page_referrer ILIKE '%chatgpt%' OR s.first_page_url ILIKE '%chatgpt%') or
+                   s.first_page_referrer ILIKE '%copilot.microsoft%' or
+                   s.first_page_referrer ILIKE '%perplexity%' or
+                   s.first_page_referrer ILIKE '%gemini.google%' or 
+                   s.first_page_referrer ILIKE '%claude%' or
+                   s.first_page_referrer ILIKE '%andisearch%' or
+                   s.first_page_referrer ILIKE '%bagoodex%' or
+                   s.first_page_referrer ILIKE '%brave%' or
+                   s.first_page_referrer ILIKE '%grok%' THEN 'AI Search'
+               WHEN c.traffic_source IN ('Organic') AND c.traffic_channel IN ('Direct','Search') AND COALESCE(c.permalease_call_ind,0) = 0 THEN 'Organic'
+               WHEN c.traffic_source IN ('Direct')  AND c.traffic_channel IN ('Direct','Search') AND COALESCE(c.permalease_call_ind,0) = 0 THEN 'Direct'
+               WHEN c.traffic_source IN ('Organic','Direct') AND c.traffic_channel IN ('Referral') AND COALESCE(c.permalease_call_ind,0) = 0 THEN 'Referral'
+               WHEN c.traffic_channel = 'Social' AND COALESCE(c.permalease_call_ind,0) = 0 THEN 'Social'
+               ELSE 'Other'
+           END AS MarketingChannel,
+           COUNT(DISTINCT CASE WHEN c.ib_gross_ind>0 THEN c.call_id END) AS GrossCalls,
+           COUNT(DISTINCT CASE WHEN c.ib_queue_ind>0 THEN c.call_id END) AS QueueCalls,
+           COUNT(DISTINCT CASE WHEN c.ibs_net_ind>0 THEN c.call_id END)  AS NetCalls,
+           SUM(c.ibs_abandon_ind) AS Abandons,
+           COUNT(DISTINCT CASE WHEN c.ib_gross_ind > 0 AND c.web_session_id IS NULL
+               AND (pl.channel = 'Fallback' OR c.campaign ILIKE '%pMax%'
+                    OR (c.campaign ILIKE '%a:CTXP%' OR c.campaign ILIKE '%a:SOE%' OR c.campaign ILIKE '%a:TXER%' OR c.campaign ILIKE '%a:CHOO%')
+                    OR (c.traffic_source = 'Paid' AND c.traffic_channel = 'Search'))
+               THEN c.call_id END) AS Gross_serp,
+           COUNT(DISTINCT CASE WHEN c.ib_queue_ind > 0 AND c.web_session_id IS NULL
+               AND (pl.channel = 'Fallback' OR c.campaign ILIKE '%pMax%'
+                    OR (c.campaign ILIKE '%a:CTXP%' OR c.campaign ILIKE '%a:SOE%' OR c.campaign ILIKE '%a:TXER%' OR c.campaign ILIKE '%a:CHOO%')
+                    OR (c.traffic_source = 'Paid' AND c.traffic_channel = 'Search'))
+               THEN c.call_id END) AS queue_serp,
+           COUNT(DISTINCT CASE WHEN c.ibs_net_ind > 0 AND c.web_session_id IS NULL
+               AND (pl.channel = 'Fallback' OR c.campaign ILIKE '%pMax%'
+                    OR (c.campaign ILIKE '%a:CTXP%' OR c.campaign ILIKE '%a:SOE%' OR c.campaign ILIKE '%a:TXER%' OR c.campaign ILIKE '%a:CHOO%')
+                    OR (c.traffic_source = 'Paid' AND c.traffic_channel = 'Search'))
+               THEN c.call_id END) AS net_serp,
+           COUNT(DISTINCT CASE WHEN c.ib_queue_ind>0 THEN c.call_id END) * MAX(s.scc_per_call) AS sales_center_cost
+       FROM energy_prod.energy.v_calls c
+       JOIN cte_variables v
+         ON c.call_date_est BETWEEN v.start_date AND v.end_date
+       LEFT JOIN cte_permalease pl
+         ON pl.permalease = c.dnis
+        AND c.call_date_est BETWEEN pl.start_date AND pl.end_date
+       LEFT JOIN cte_scc s
+         ON s.month = DATE_TRUNC('month', c.call_date_est)
+       LEFT JOIN energy_prod.energy.v_sessions s on s.webcontext_session_id = c.web_session_id
+       WHERE COALESCE(c.company_id, 25) = 25
+         AND ivr_profile_name NOT ILIKE '%TXU%'
+         AND ivr_profile_name NOT ILIKE '%NTX%'
+         AND c.call_direction = 'INBOUND'
+       GROUP BY 1,2
+   ),
+
+
+   cte_orders AS (
+     SELECT
+       o.order_date_est AS rpt_date,
+       CASE
+         WHEN c.call_direction <> 'INBOUND' THEN COALESCE(oor.reclass_channel, 'Other')
+         WHEN (o.traffic_source IN ('Email') OR c.traffic_source IN ('Email') OR s.traffic_source IN ('Email'))
+           OR (o.traffic_channel IN ('Email') OR c.traffic_channel IN ('Email') OR s.traffic_channel IN ('Email'))
+           OR pl.channel = 'Email' THEN 'Email'
+         WHEN (o.traffic_source IN ('SMS') OR c.traffic_source IN ('SMS') OR s.traffic_source IN ('SMS'))
+           OR (o.traffic_channel IN ('SMS') OR c.traffic_channel IN ('SMS') OR s.traffic_channel IN ('SMS'))
+           OR pl.channel = 'SMS' THEN 'SMS'
+         WHEN o.campaign ILIKE '%^Display%' THEN 'Display'
+         WHEN o.campaign ILIKE '%pMax%'     THEN 'pMax'
+         WHEN (o.campaign ILIKE '%a:CTXP%' OR o.campaign ILIKE '%a:SOE%' OR o.campaign ILIKE '%a:TXER%' OR o.campaign ILIKE '%a:CHOO%')
+           OR ((o.traffic_source = 'Paid' OR s.traffic_source = 'Paid' OR c.traffic_source = 'Paid')
+             AND (o.traffic_channel = 'Search' OR c.traffic_channel = 'Search' OR s.traffic_channel = 'Search'))
+           OR pl.channel = 'Fallback' THEN 'Paid Search'
+         WHEN (s.first_page_referrer ILIKE '%chatgpt%' OR s.first_page_url ILIKE '%chatgpt%') or
+                   s.first_page_referrer ILIKE '%copilot.microsoft%' or
+                   s.first_page_referrer ILIKE '%perplexity%' or
+                   s.first_page_referrer ILIKE '%gemini.google%' or 
+                   s.first_page_referrer ILIKE '%claude%' or
+                   s.first_page_referrer ILIKE '%andisearch%' or
+                   s.first_page_referrer ILIKE '%bagoodex%' or
+                   s.first_page_referrer ILIKE '%brave%' or
+                   s.first_page_referrer ILIKE '%grok%' THEN 'AI Search'
+         WHEN (o.traffic_source IN ('Organic') OR c.traffic_source IN ('Organic') OR s.traffic_source IN ('Organic'))
+           AND (o.traffic_channel IN ('Direct','Search') OR c.traffic_channel IN ('Direct','Search') OR s.traffic_channel IN ('Direct','Search'))
+           AND COALESCE(c.permalease_call_ind,0) = 0 THEN 'Organic'
+         WHEN o.traffic_source IN ('Affiliate','Affliate') OR c.traffic_source IN ('Affiliate','Affliate') OR s.traffic_source IN ('Affiliate','Affliate') OR pl.channel = 'Affiliate'
+              OR (s.campaign ILIKE '%CapitalOne%' OR s.campaign ILIKE '%CoolDown%' OR s.campaign ILIKE '%EnergyBot%'
+                  OR s.campaign ILIKE '%Entrata%' OR s.campaign ILIKE '%FindEnergy%' OR s.campaign ILIKE '%Finder%'
+                  OR s.campaign ILIKE '%Moved%' OR s.campaign ILIKE '%Petscreening%' OR s.campaign ILIKE 'United'
+                  OR s.campaign ILIKE '%UtilityValet%' OR s.campaign ILIKE '%mcclatchy%' OR s.campaign ILIKE '%honey%'
+                  OR s.campaign ILIKE '%fwst%' OR s.campaign ILIKE '%united%' OR s.campaign ILIKE '%UHS%'
+                  OR s.campaign ILIKE '%SavingsPro%' OR s.campaign ILIKE '%Utilitiesformyhome%' OR s.campaign ILIKE '%PrintDistribution%')
+           THEN 'Affiliate'
+         WHEN (o.traffic_source = 'Paid' OR s.traffic_source = 'Paid' OR c.traffic_source = 'Paid')
+           AND (o.traffic_channel = 'Social' OR c.traffic_channel = 'Social' OR s.traffic_channel = 'Social')
+           AND COALESCE(c.permalease_call_ind,0) = 0 THEN 'Social'
+         WHEN (o.traffic_source IN ('Direct')) AND (o.traffic_channel IN ('Direct'))
+           AND COALESCE(c.permalease_call_ind,0) = 0 THEN 'Direct'
+         WHEN (o.traffic_source IN ('Organic','Direct') OR c.traffic_source IN ('Organic','Direct') OR s.traffic_source IN ('Organic','Direct'))
+           AND (o.traffic_channel IN ('Referral') OR c.traffic_channel IN ('Referral') OR s.traffic_channel IN ('Referral'))
+           AND COALESCE(c.permalease_call_ind,0) = 0 THEN 'Referral'
+         WHEN (o.traffic_source IN ('Internal') OR c.traffic_source IN ('Internal') OR s.traffic_source IN ('Internal'))
+           AND COALESCE(c.permalease_call_ind,0) = 0 THEN 'Internal'
+         ELSE 'Other'
+       END AS MarketingChannel,
+       COUNT(DISTINCT CASE WHEN o.order_type = 'Phone' THEN o.order_id END) AS TotalPhoneOrders,
+       COUNT(DISTINCT CASE
+ WHEN o.order_type = 'Phone' AND (
+       -- A) site SERP (on the order’s call/session)
+       ( c.web_session_id IS NULL AND (
+             pl.channel = 'Fallback'
+          OR o.campaign ILIKE '%pMax%'
+          OR (o.campaign ILIKE '%a:CTXP%' OR o.campaign ILIKE '%a:SOE%' OR o.campaign ILIKE '%a:TXER%' OR o.campaign ILIKE '%a:CHOO%')
+          OR ((o.traffic_source = 'Paid' OR s.traffic_source = 'Paid' OR c.traffic_source = 'Paid')
+              AND (o.traffic_channel = 'Search' OR c.traffic_channel = 'Search' OR s.traffic_channel = 'Search'))
+       ))
+       -- B) reclass SERP (on the prior inbound call)
+    OR ( c.call_direction <> 'INBOUND'
+         AND COALESCE(oor.reclass_channel,'') IN ('Paid Search','pMax')
+         AND oor.rc_serp_order = 1 )
+ )
+ THEN o.order_id END
+) AS serp_orders,
+
+
+       SUM(CASE
+             WHEN o.order_type = 'Phone' AND o.order_date_est >= '2025-04-01' AND p.referenceId IS NOT NULL AND o.partner_name NOT IN ('APG&E','Atlantex') THEN (g.gcv_new_v2 * 0.95)
+             WHEN o.order_type = 'Phone' AND o.order_date_est >= '2025-04-01' THEN g.gcv_new_v2
+             WHEN o.order_type = 'Phone' AND o.order_date_est >= '2025-02-01' THEN g.gcv_new_v1
+             WHEN o.order_type = 'Phone' AND o.order_date_est <  '2025-02-01' THEN (o.undiscounted_gcv * o.predicted_activation_rate)
+           END) AS TotalPhoneGCV,
+       COUNT(DISTINCT CASE WHEN o.order_type = 'Cart' THEN o.order_id END) AS TotalCartOrders,
+       SUM(CASE
+             WHEN o.order_type = 'Cart' AND o.order_date_est >= '2025-04-01' AND p.referenceId IS NOT NULL AND o.partner_name NOT IN ('APG&E','Atlantex') THEN (g.gcv_new_v2 * 0.95)
+             WHEN o.order_type = 'Cart' AND o.order_date_est >= '2025-04-01' THEN g.gcv_new_v2
+             WHEN o.order_type = 'Cart' AND o.order_date_est >= '2025-02-01' THEN g.gcv_new_v1
+             WHEN o.order_type = 'Cart' AND o.order_date_est <  '2025-02-01' THEN (o.undiscounted_gcv * o.predicted_activation_rate)
+           END) AS TotalCartGCV,
+       SUM(CASE
+             WHEN o.order_date_est >= '2025-04-01' AND p.referenceId IS NOT NULL AND o.partner_name NOT IN ('APG&E','Atlantex') THEN (g.gcv_new_v2 * 0.95)
+             WHEN o.order_date_est >= '2025-04-01' THEN g.gcv_new_v2
+             WHEN o.order_date_est >= '2025-02-01' THEN g.gcv_new_v1
+             WHEN o.order_date_est <  '2025-02-01' THEN (o.undiscounted_gcv * o.predicted_activation_rate)
+           END) AS gcv
+     FROM energy_prod.energy.v_orders o
+     JOIN cte_variables v
+       ON o.order_date_est BETWEEN v.start_date AND v.end_date
+     LEFT JOIN energy_prod.energy.v_calls c
+       ON c.call_id = o.call_id
+      AND c.call_date_est BETWEEN v.start_date AND v.end_date
+     LEFT JOIN energy_prod.energy.v_sessions s
+       ON s.webcontext_session_id = o.webcontext_session_id
+      AND s.session_start_date_est BETWEEN v.start_date AND v.end_date
+     LEFT JOIN energy_prod.energy.v_orders_gcv g
+       ON g.order_id = o.order_id
+      AND g.order_date_est BETWEEN v.start_date AND v.end_date
+     LEFT JOIN cte_permalease pl
+       ON pl.permalease = c.dnis
+      AND c.call_date_est BETWEEN pl.start_date AND pl.end_date
+     LEFT JOIN cte_outbound_order_reclass oor
+       ON oor.order_id = o.order_id
+     LEFT JOIN (
+       SELECT DISTINCT referenceId
+       FROM lakehouse_production.energy.event_energy_personainquirycompleted
+     ) p ON o.order_id = p.referenceId
+     WHERE o.txorder_ind = 1
+       AND COALESCE(o.company_id, 25) = 25
+       AND (s.is_internal_ip = FALSE OR s.is_internal_ip IS NULL)
+       AND (o.tenant_id != 'src_1ax2zVVJJ2cB9aBFEnVcRPog5Pe' OR o.tenant_id IS NULL)
+       AND o.partner_name <> 'TXU Branded Energy'
+     GROUP BY 1,2
+   ),
+
+
+
+
+   cte_paid_search AS (
+     SELECT
+       ps.rpt_date,
+       CASE WHEN ps.campaign_name ILIKE '%pmax%' THEN 'pMax'
+            WHEN ps.campaign_name ILIKE '%^Display%' THEN 'Display'
+            ELSE 'Paid Search' END AS MarketingChannel,
+       SUM(ps.impressions) AS impressions,
+       SUM(ps.clicks) AS Clicks,
+       SUM(ps.spend) AS MarketingCost
+     FROM energy_prod.energy.paidsearch_campaign ps
+     JOIN cte_variables v
+       ON ps.rpt_date BETWEEN v.start_date AND v.end_date
+     WHERE ps.campaign_name ILIKE '%g:TX%'
+       AND (ps.campaign_name ILIKE '%a:CTXP%' OR ps.campaign_name ILIKE '%a:SOE%' OR ps.campaign_name ILIKE '%a:TXER%' OR ps.campaign_name ILIKE '%a:CHOO%' OR ps.campaign_name ILIKE '%^Display%')
+     GROUP BY 1,2
+     HAVING COALESCE(MarketingCost, 0) > 0
+   ),
+
+
+   cross_sell_monthly AS (
+     SELECT
+         dd.full_date AS rpt_date,
+         MAX(CASE WHEN cr.partner = 'AllConnect'      THEN cr.compensation END) AS allconnect_comp,
+         MAX(CASE WHEN cr.partner = 'ADT Security'    THEN cr.compensation END) AS adt_comp,
+         MAX(CASE WHEN cr.partner = 'Vivint Security' THEN cr.compensation END) AS vivint_comp
+     FROM (
+         SELECT
+             partner,
+             compensation,
+             energy_prod.energy.f_convert_string_to_date(REPLACE(cs.start_date, '-', '/')) AS start_date,
+             COALESCE(
+               DATEADD(DAY, -1,
+                 LEAD(energy_prod.energy.f_convert_string_to_date(REPLACE(cs.start_date, '-', '/')))
+                   OVER (PARTITION BY partner ORDER BY energy_prod.energy.f_convert_string_to_date(REPLACE(cs.start_date, '-', '/')))
+               ),
+               DATE('2099-01-01')
+             ) AS end_date,
+             ROW_NUMBER() OVER (
+               PARTITION BY partner, energy_prod.energy.f_convert_string_to_date(REPLACE(cs.start_date, '-', '/'))
+               ORDER BY cs._fivetran_synced DESC
+             ) AS rn
+         FROM energy_prod.fivetran_finance.cross_sell cs
+     ) cr
+     JOIN energy_prod.energy.date_dim dd
+       ON dd.full_date BETWEEN cr.start_date AND cr.end_date
+     WHERE cr.rn = 1
+     GROUP BY dd.full_date
+   ),
+
+
+   cross_sell_calls AS (
+     SELECT
+         dd.full_date AS rpt_date,
+         SUM(c.allconnect_transition_ind)    AS allconnect_cnt,
+         SUM(c.adt_security_transfer_ind)    AS adt_cnt,
+         SUM(c.vivint_security_transfer_ind) AS vivint_cnt
+     FROM energy_prod.energy.v_agent_calls c
+     JOIN energy_prod.energy.date_dim dd
+       ON dd.full_date = c.call_date_est
+     WHERE dd.full_date >= DATE('2025-01-01')
+     GROUP BY dd.full_date
+   ),
+
+
+   cte_crosssell AS (
+     SELECT
+         c.rpt_date,
+         'Cross Sell' AS MarketingChannel,
+         (c.allconnect_cnt + c.adt_cnt + c.vivint_cnt) AS total_transitions,
+         (c.allconnect_cnt * COALESCE(m.allconnect_comp, 0))
+       + (c.adt_cnt        * COALESCE(m.adt_comp, 0))
+       + (c.vivint_cnt     * COALESCE(m.vivint_comp, 0)) AS cross_sell_rev
+     FROM cross_sell_calls c
+     LEFT JOIN cross_sell_monthly m USING (rpt_date)
+   ),
+
+
+   cte_paid_social AS (
+     SELECT
+       f.date AS rpt_date,
+       'Social' AS MarketingChannel,
+       SUM(f.inline_link_clicks) AS Clicks,
+       SUM(f.impressions) AS Impressions,
+       SUM(f.spend) AS MarketingCost
+     FROM energy_prod.energy_facebook.ads f
+     JOIN cte_variables v
+       ON f.date BETWEEN v.start_date AND v.end_date
+     GROUP BY 1,2
+   ),
+
+
+   cte_affiliate_spend AS (
+     SELECT
+       rpt_date,
+       MarketingChannel,
+       (SUM(TotalPhoneOrders) + SUM(TotalCartOrders)) * 100 AS MarketingCost
+     FROM cte_orders
+     WHERE MarketingChannel = 'Affiliate'
+     GROUP BY 1,2
+   ),
+
+
+   cte_group_by_columns AS (
+     SELECT DISTINCT rpt_date, MarketingChannel FROM cte_carts
+     UNION SELECT DISTINCT rpt_date, MarketingChannel FROM cte_sessions
+     UNION SELECT DISTINCT rpt_date, MarketingChannel FROM cte_calls
+     UNION SELECT DISTINCT rpt_date, MarketingChannel FROM cte_orders
+     UNION SELECT DISTINCT rpt_date, MarketingChannel FROM cte_paid_search
+     UNION SELECT DISTINCT rpt_date, MarketingChannel FROM cte_crosssell
+     UNION SELECT DISTINCT rpt_date, MarketingChannel FROM cte_paid_social
+     UNION SELECT DISTINCT rpt_date, MarketingChannel FROM cte_affiliate_spend
+   )
+
+
+, cte_final_output AS (
+ SELECT
+   g.rpt_date AS TheDate,
+   dd.week_begin_date AS WeekBeginning,                          -- not in Q2
+   dd.calendar_year_month AS calendar_year_month,                -- was: month
+   CASE
+     WHEN g.MarketingChannel IN ('Social','Display') THEN 'Social'
+     WHEN g.MarketingChannel IN ('Other','Internal','Referral') THEN 'Other'
+     ELSE g.MarketingChannel
+   END AS MarketingChannel,
+
+
+   COALESCE(SUM(ps.impressions),0) + COALESCE(SUM(so.impressions),0) AS impressions,   -- Q2 sets to 0
+   COALESCE(SUM(ps.Clicks),0)     + COALESCE(SUM(so.Clicks),0)       AS clicks,        -- Q2 sets to 0
+   COALESCE(SUM(s.Sessions),0)    AS Total_Sessions,                                  -- was: Sessions
+
+
+
+
+   COALESCE(SUM(s.ZipEntries), 0) as ZipEntries,
+
+
+   /* No direct Q2 column (commented there); keeping for now */
+   SUM(CASE WHEN g.marketingchannel IN ('pMax','Paid Search','Display') THEN ps.clicks
+            WHEN g.marketingchannel = 'Social' THEN so.Clicks
+            WHEN g.marketingchannel NOT IN ('pMax','Paid Search','Social','Display') THEN s.sessions
+            ELSE 0 END) AS interactions,
+
+
+   /* SERP calls map cleanly */
+   COALESCE(SUM(c.Gross_serp),0)  AS GrossSerpCalls,             -- was: serp_gross_calls
+   COALESCE(SUM(c.queue_serp),0)  AS QueueSerpCalls,             -- was: serp_queue_calls
+   COALESCE(SUM(c.queue_serp),0) - COALESCE(SUM(c.net_serp),0) AS serp_abandon_calls,  -- no Q2 equivalent at SERP level
+   COALESCE(SUM(c.net_serp),0)    AS NetSerpCalls,               -- was: serp_net_calls
+   COALESCE(SUM(o.serp_orders),0) AS Serp_Orders,                -- same metric
+
+
+   /* “Site” split does not exist in Q2; leaving names as-is */
+   (COALESCE(SUM(c.GrossCalls),0) - COALESCE(SUM(c.Gross_serp),0)) AS site_gross_calls,
+   (COALESCE(SUM(c.QueueCalls),0) - COALESCE(SUM(c.queue_serp),0)) AS site_queue_calls,
+   ((COALESCE(SUM(c.QueueCalls),0) - COALESCE(SUM(c.queue_serp),0))
+    - (COALESCE(SUM(c.NetCalls),0) - COALESCE(SUM(c.net_serp),0))) AS site_abandon_calls,
+   (COALESCE(SUM(c.NetCalls),0)   - COALESCE(SUM(c.net_serp),0))   AS site_net_calls,
+
+
+   COALESCE(SUM(o.TotalPhoneOrders),0) - COALESCE(SUM(o.serp_orders),0) AS site_phone_orders,  -- Q2 has no site-only phone orders
+   COALESCE(SUM(o.TotalPhoneOrders),0) AS TotalPhoneOrders,             -- was: phone_orders
+
+
+   COALESCE(SUM(ct.CartEntries),0) AS CartEntries,                      -- was: cart_entries
+   COALESCE(SUM(o.TotalCartOrders),0)  AS TotalCartOrders,              -- was: cart_orders
+
+
+   COALESCE(SUM(o.TotalPhoneGCV),0) + COALESCE(SUM(cs.cross_sell_rev),0) AS TotalPhoneGCV,  -- was: phone_revenue
+   COALESCE(SUM(o.TotalCartGCV),0)                                       AS TotalCartGCV,   -- was: cart_revenue
+
+
+   0 AS SalesCenterCost,                                                 -- was: scc
+   (COALESCE(SUM(o.TotalPhoneGCV),0) + COALESCE(SUM(o.TotalCartGCV),0) + COALESCE(SUM(cs.cross_sell_rev),0)) AS total_revenue,
+
+
+   /* Q2 has a (typo’d) MarkjetingCost column; matching that name but keep Query 1 logic */
+   COALESCE(SUM(ps.MarketingCost),0) + COALESCE(SUM(so.MarketingCost),0) + COALESCE(SUM(af.MarketingCost),0) AS MarkjetingCost
+
+
+ FROM cte_group_by_columns g
+ JOIN cte_variables v
+   ON g.rpt_date BETWEEN v.start_date AND v.end_date
+ LEFT JOIN energy_prod.energy.date_dim dd ON dd.full_date = g.rpt_date
+
+
+ LEFT JOIN cte_carts       ct ON ct.rpt_date = g.rpt_date AND ct.MarketingChannel = g.MarketingChannel
+ LEFT JOIN cte_sessions     s ON  s.rpt_date = g.rpt_date AND  s.MarketingChannel = g.MarketingChannel
+ LEFT JOIN cte_calls        c ON  c.rpt_date = g.rpt_date AND  c.MarketingChannel = g.MarketingChannel
+ LEFT JOIN cte_orders       o ON  o.rpt_date = g.rpt_date AND  o.MarketingChannel = g.MarketingChannel
+ LEFT JOIN cte_paid_search ps ON ps.rpt_date = g.rpt_date AND ps.MarketingChannel = g.MarketingChannel
+ LEFT JOIN cte_crosssell   cs ON cs.rpt_date = g.rpt_date AND cs.MarketingChannel = g.MarketingChannel
+ LEFT JOIN cte_paid_social so ON so.rpt_date = g.rpt_date AND so.MarketingChannel = g.MarketingChannel
+ LEFT JOIN cte_affiliate_spend af ON af.rpt_date = g.rpt_date AND af.MarketingChannel = g.MarketingChannel
+
+
+ GROUP BY 1,2,3,4
+)
+
+
+SELECT *
+FROM cte_final_output
+ORDER BY TheDate DESC
