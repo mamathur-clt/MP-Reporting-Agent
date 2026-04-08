@@ -139,3 +139,16 @@ TIME_MODES = {
     "MoM": "Month over Month (calendar month vs prior calendar month)",
     "Custom": "Custom date ranges",
 }
+
+# ---------------------------------------------------------------------------
+# LLM-readable KPI formulas (serialised once at import time)
+# ---------------------------------------------------------------------------
+
+def _build_kpi_formulas_text() -> str:
+    lines = []
+    for key, kpi in KPIS.items():
+        desc = f" — {kpi.description}" if kpi.description else ""
+        lines.append(f"  {key} ({kpi.name}): {kpi.numerator} / {kpi.denominator}{desc}")
+    return "\n".join(lines)
+
+KPI_FORMULAS_TEXT = _build_kpi_formulas_text()

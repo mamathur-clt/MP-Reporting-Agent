@@ -26,7 +26,13 @@ from app.decomposition import (
     compute_initiative_impact,
     _initiative_label,
 )
-from app.narrative import generate_llm_narrative, build_chat_system_prompt, stream_chat_response
+from app.narrative import generate_llm_narrative, build_chat_system_prompt, stream_chat_response, run_analyst_chat
+from app.analyst_tools import (
+    build_schema_context,
+    build_analyst_system_prompt,
+    TOOL_DEFINITIONS,
+    make_tool_executor,
+)
 from app.finance_data import fetch_finance_daily, fetch_plan_pacing, build_funnel_summary, render_summary_html
 
 # ---------------------------------------------------------------------------
@@ -113,7 +119,10 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 # Load data
 # ---------------------------------------------------------------------------
-query_start = min(curr_start, prior_start)
+# Pad query start back 1 day: the step_completions CTE in the session_level_query
+# uses `_date > var.start_date` (strict >), so sessions on the exact start_date
+# would miss their SSN/credit completion joins without the padding.
+query_start = min(curr_start, prior_start) - timedelta(days=1)
 query_end = max(curr_end, prior_end)
 
 with st.spinner("Loading session data from Databricks…"):
@@ -267,12 +276,15 @@ if not top_drivers.empty:
             continue
         all_bars.append({
             "label": f"{_dim_label(row['dimension'])}: {row['segment']}",
+            "mix_pp": row["mix_effect"] * 100,
+            "rate_pp": row["rate_effect"] * 100,
             "pp": row["total_contribution"] * 100,
             "type": "dimension",
         })
 
-# Add initiative WoW change bars (only if impact actually changed period-over-period)
-if not impact_current.empty:
+# Add initiative WoW change bars only if large enough to compete with dimensional drivers
+if not impact_current.empty and all_bars:
+    _min_dim_bar = min(abs(b["pp"]) for b in all_bars)
     _init_delta = pd.merge(
         impact_current[["initiative", "scaled_impact_on_kpi"]].rename(
             columns={"scaled_impact_on_kpi": "curr_impact"}
@@ -284,31 +296,47 @@ if not impact_current.empty:
     ).fillna(0)
     _init_delta["wow_change"] = _init_delta["curr_impact"] - _init_delta["prior_impact"]
 
-    _INIT_THRESHOLD = 0.0001  # ignore changes smaller than 0.01pp
     for _, row in _init_delta.iterrows():
-        if abs(row["wow_change"]) >= _INIT_THRESHOLD:
+        wow_pp = row["wow_change"] * 100
+        if abs(wow_pp) >= _min_dim_bar:
             all_bars.append({
                 "label": f"Initiative: {row['initiative']}",
-                "pp": row["wow_change"] * 100,
+                "mix_pp": 0.0,
+                "rate_pp": wow_pp,
+                "pp": wow_pp,
                 "type": "initiative",
             })
 
 if all_bars:
     bars_df = pd.DataFrame(all_bars).sort_values("pp", ascending=True)
-    colors = ["#2ecc71" if r["pp"] >= 0 else "#e74c3c" for _, r in bars_df.iterrows()]
 
-    fig = go.Figure(go.Bar(
+    mix_colors = ["#82e0aa" if v >= 0 else "#f1948a" for v in bars_df["mix_pp"]]
+    rate_colors = ["#27ae60" if v >= 0 else "#c0392b" for v in bars_df["rate_pp"]]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
         y=bars_df["label"],
-        x=bars_df["pp"],
+        x=bars_df["mix_pp"],
         orientation="h",
-        marker_color=colors,
+        name="Mix Effect",
+        marker_color=mix_colors,
+        hovertemplate="%{y}<br>Mix: %{x:+.2f}pp<extra></extra>",
+    ))
+    fig.add_trace(go.Bar(
+        y=bars_df["label"],
+        x=bars_df["rate_pp"],
+        orientation="h",
+        name="Rate Effect",
+        marker_color=rate_colors,
         text=[f"{v:+.2f}pp" for v in bars_df["pp"]],
         textposition="outside",
         textfont=dict(size=12),
+        hovertemplate="%{y}<br>Rate: %{x:+.2f}pp<extra></extra>",
     ))
 
     total_pp = summary["delta"] * 100
     fig.update_layout(
+        barmode="relative",
         title=f"Top drivers of {KPIS[kpi_key].short_name} change ({pct_change_str}, {total_pp:+.2f}pp)",
         xaxis_title="Contribution (pp)",
         xaxis=dict(zeroline=True, zerolinewidth=2, zerolinecolor="gray"),
@@ -317,14 +345,14 @@ if all_bars:
         ),
         yaxis_title="",
         height=max(480, len(bars_df) * 55),
-        margin=dict(l=20, r=100),
-        showlegend=False,
+        margin=dict(l=20, r=120),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
     st.plotly_chart(fig, use_container_width=True)
     st.caption(
-        "Green/red bars = dimensional drivers (mix + rate effects). "
-        "Blue/orange bars = WoW change in initiative impact "
-        "(how much more or less the initiative contributed vs prior period)."
+        "Each bar splits into **mix effect** (lighter — traffic share shifted) "
+        "and **rate effect** (darker — conversion rate changed within that segment). "
+        "Initiative bars show WoW change in scaled impact (rate only)."
     )
 
     with st.expander("Driver detail (mix vs rate breakdown)"):
@@ -510,14 +538,15 @@ with st.spinner("Generating summary with GPT-4o…"):
 st.markdown(narrative)
 
 # ---------------------------------------------------------------------------
-# Section 7: Chat with the analyst
+# Section 7: Ask the Analyst (with data access)
 # ---------------------------------------------------------------------------
 st.header("7. Ask the Analyst")
 st.caption(
-    "Chat with GPT-4o about the analysis above. It has full context of the "
-    "KPI summary, decomposition, and initiative results."
+    "Chat with GPT-4o — it can query the loaded session and finance data "
+    "or run SQL against Databricks to answer ad-hoc questions."
 )
 
+# Build base analysis context (reuses existing prompt builder)
 _funnel_text = ""
 try:
     _funnel_for_chat = compute_funnel_table(df_current, df_prior)
@@ -535,28 +564,80 @@ _chat_system_prompt = build_chat_system_prompt(
     initiative_impact_prior=impact_prior if not impact_prior.empty else None,
 )
 
+# Augment with data-access tools
+_analyst_finance = None
+try:
+    _analyst_finance = _finance_df  # may not exist if finance fetch failed
+except NameError:
+    pass
+
+_schema_ctx = build_schema_context(df_all, _analyst_finance)
+_filter_parts = []
+if channel_filter:
+    _filter_parts.append(f"Channels: {', '.join(channel_filter)}")
+if website_filter:
+    _filter_parts.append(f"Websites: {', '.join(website_filter)}")
+_analyst_prompt = build_analyst_system_prompt(
+    _chat_system_prompt,
+    _schema_ctx,
+    current_filters="; ".join(_filter_parts) if _filter_parts else "",
+)
+_tool_executor = make_tool_executor(df_all, _analyst_finance)
+
 if "chat_messages" not in st.session_state:
     st.session_state.chat_messages = []
 
+# Replay previous messages
 for msg in st.session_state.chat_messages:
     with st.chat_message(msg["role"]):
+        for tr in msg.get("tool_results", []):
+            with st.expander(f"Data: {tr['explanation']}", expanded=False):
+                if isinstance(tr.get("result_obj"), pd.DataFrame):
+                    st.dataframe(tr["result_obj"], use_container_width=True, hide_index=True)
+                elif tr.get("result_str"):
+                    st.code(tr["result_str"])
         st.markdown(msg["content"])
 
-if prompt := st.chat_input("Ask a question about the analysis…"):
+if prompt := st.chat_input("Ask a question about the data…"):
     st.session_state.chat_messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        try:
-            response_text = st.write_stream(
-                stream_chat_response(st.session_state.chat_messages, _chat_system_prompt)
-            )
-            st.session_state.chat_messages.append({"role": "assistant", "content": response_text})
-        except Exception as e:
-            error_msg = f"Error calling OpenAI: {e}"
-            st.error(error_msg)
-            st.session_state.chat_messages.append({"role": "assistant", "content": error_msg})
+        with st.spinner("Analyzing…"):
+            try:
+                final_text, tool_results = run_analyst_chat(
+                    st.session_state.chat_messages,
+                    _analyst_prompt,
+                    TOOL_DEFINITIONS,
+                    _tool_executor,
+                )
+            except Exception as e:
+                final_text = f"Error: {e}"
+                tool_results = []
+
+        for tr in tool_results:
+            with st.expander(f"Data: {tr['explanation']}", expanded=True):
+                if isinstance(tr.get("result_obj"), pd.DataFrame):
+                    st.dataframe(
+                        tr["result_obj"], use_container_width=True, hide_index=True,
+                    )
+                elif tr.get("result_str"):
+                    st.code(tr["result_str"])
+
+        st.markdown(final_text)
+        st.session_state.chat_messages.append({
+            "role": "assistant",
+            "content": final_text,
+            "tool_results": [
+                {
+                    "explanation": tr["explanation"],
+                    "result_str": tr["result_str"],
+                    "result_obj": tr["result_obj"],
+                }
+                for tr in tool_results
+            ],
+        })
 
 # ---------------------------------------------------------------------------
 # Footer

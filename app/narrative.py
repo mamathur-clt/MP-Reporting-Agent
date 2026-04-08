@@ -238,6 +238,65 @@ def stream_chat_response(
             yield chunk.choices[0].delta.content
 
 
+def run_analyst_chat(
+    messages: list[dict],
+    system_prompt: str,
+    tools: list[dict],
+    tool_executor,
+    max_rounds: int = 3,
+) -> tuple[str, list[dict]]:
+    """
+    Chat completion with an OpenAI tool-calling loop.
+
+    Returns ``(final_text, tool_outputs)`` where *tool_outputs* is a list of
+    ``{"tool": str, "explanation": str, "result_str": str, "result_obj": Any}``.
+    Intermediate tool calls are resolved automatically (up to *max_rounds*).
+    """
+    client = _get_client()
+    full_messages = [{"role": "system", "content": system_prompt}] + [
+        {"role": m["role"], "content": m["content"]} for m in messages
+    ]
+    tool_outputs: list[dict] = []
+
+    response = None
+    for _ in range(max_rounds):
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=full_messages,
+            tools=tools,
+            temperature=0.3,
+            max_tokens=2000,
+        )
+        choice = response.choices[0]
+        msg = choice.message
+
+        if msg.tool_calls:
+            full_messages.append(msg)
+            for tc in msg.tool_calls:
+                result_str, result_obj, explanation = tool_executor(
+                    tc.function.name, tc.function.arguments,
+                )
+                tool_outputs.append({
+                    "tool": tc.function.name,
+                    "explanation": explanation,
+                    "result_str": result_str,
+                    "result_obj": result_obj,
+                })
+                full_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result_str,
+                })
+        else:
+            return msg.content or "", tool_outputs
+
+    last = response.choices[0].message.content if response else ""
+    return (
+        last or "Analysis could not be completed within the allowed steps.",
+        tool_outputs,
+    )
+
+
 def _fallback_narrative(
     summary: dict,
     top_drivers: pd.DataFrame,

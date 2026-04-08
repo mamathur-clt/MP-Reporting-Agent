@@ -1,6 +1,7 @@
 python-dotenv
 databricks-sql-connector
 pandas
+numpy
 streamlit
 plotly
 certifi
