@@ -1,0 +1,910 @@
+WITH cte_variables AS (
+    SELECT 
+          ('2025-01-01')::date AS start_date
+        ,  CURRENT_DATE::date AS end_date
+)
+
+-- =====================================================
+-- ==============  1. BASE SESSIONS  ===================
+-- =====================================================
+, base_sessions as (
+  select s.web_context_anonymous_id
+    , s.webcontext_session_id
+    , s.session_start_date_est
+    , s.unique_pages_viewed
+    , s.apartment_home
+    , s.first_page_url
+    , s.first_page_no_query_string
+    , s.first_page_domain
+    , s.first_page_referrer_no_query_string
+    , s.first_page_url_first_folder
+    , s.campaign_bucket
+    , s.isp_name
+    , s.session_start_ts_est
+    , s.is_bot
+    , s.device_type
+    , s.city
+    , s.entered_zip
+    , case when s.entered_zip is not null then 1 else 0 end as zip_entry
+    , s.postal_code
+    , s.region
+    , s.mover_switcher
+    , s.utility_area
+    , CASE
+          WHEN s.campaign ILIKE '%^Display%' THEN 'Display'
+          WHEN s.traffic_source = 'Paid' AND s.traffic_channel = 'Search' THEN 'Paid Search'
+          WHEN s.traffic_source = 'Paid' AND s.traffic_channel = 'Pmax'   THEN 'pMax'
+          WHEN (s.first_page_referrer ILIKE '%chatgpt%' OR s.first_page_url ILIKE '%chatgpt%') or
+              s.first_page_referrer ILIKE '%copilot.microsoft%' or
+              s.first_page_referrer ILIKE '%perplexity%' or
+              s.first_page_referrer ILIKE '%gemini.google%' or 
+              s.first_page_referrer ILIKE '%claude%' or
+              s.first_page_referrer ILIKE '%andisearch%' or
+              s.first_page_referrer ILIKE '%bagoodex%' or
+              s.first_page_referrer ILIKE '%brave%' or
+              s.first_page_referrer ILIKE '%grok%' THEN 'AI Search'
+          WHEN s.traffic_source IN ('Direct')  AND s.traffic_channel IN ('Direct','Search') AND s.transactional_ind = 1 THEN 'Direct'
+          WHEN s.traffic_source IN ('Organic') AND s.traffic_channel IN ('Direct','Search') AND s.transactional_ind = 1 THEN 'Organic'
+          WHEN s.traffic_source IN ('Organic','Direct') AND s.traffic_channel IN ('Referral') AND s.transactional_ind = 1 THEN 'Referral'
+          WHEN s.traffic_source IN ('Affiliate','Affliate') THEN 'Affiliate'
+          WHEN s.traffic_source IN ('Email') OR s.traffic_channel IN ('Email') THEN 'Email'
+          WHEN s.traffic_source IN ('SMS')   OR s.traffic_channel IN ('SMS')   THEN 'SMS'
+          WHEN s.traffic_channel = 'Social' THEN 'Social'
+          WHEN s.traffic_channel = 'Internal' OR s.traffic_source = 'Internal' THEN 'Internal'
+          ELSE 'Other'
+      END AS marketing_channel
+    , s.site_name  
+    , s.user_agent
+    ,  CASE WHEN s.landing_page ILIKE '%Provider%' THEN "Provider"
+         WHEN s.landing_page ILIKE '%Resources%'   THEN "Resources"
+         WHEN s.landing_page ILIKE '%Grid%'        THEN "Grid"
+         ELSE s.landing_page END as landing_page_type 
+    , CASE
+        WHEN
+          regexp_replace(lower(regexp_extract(coalesce(s.adgroup, ''), '^[^|]*', 0)), '[^a-z0-9]+', ' ') RLIKE '(^| )green mountain( |$)'
+          OR regexp_replace(lower(regexp_extract(coalesce(s.adgroup, ''), '^[^|]*', 0)), '[^a-z0-9]+', '') LIKE '%greenmountain%'
+          OR regexp_replace(lower(regexp_extract(coalesce(s.adgroup, ''), '^[^|]*', 0)), '[^a-z0-9]+', ' ') RLIKE '(^| )discount power( |$)'
+          OR regexp_replace(lower(regexp_extract(coalesce(s.adgroup, ''), '^[^|]*', 0)), '[^a-z0-9]+', ' ') RLIKE '(^| )discount( |$)'
+          OR regexp_replace(lower(regexp_extract(coalesce(s.adgroup, ''), '^[^|]*', 0)), '[^a-z0-9]+', ' ') RLIKE '(^| )direct energy( |$)'
+          OR regexp_replace(lower(regexp_extract(coalesce(s.adgroup, ''), '^[^|]*', 0)), '[^a-z0-9]+', ' ') RLIKE '(^| )direct( |$)'
+          OR regexp_replace(lower(regexp_extract(coalesce(s.adgroup, ''), '^[^|]*', 0)), '[^a-z0-9]+', ' ') RLIKE '(^| )reliant( |$)'
+          OR regexp_replace(lower(regexp_extract(coalesce(s.adgroup, ''), '^[^|]*', 0)), '[^a-z0-9]+', ' ') RLIKE '(^| )cirro( |$)'
+          OR lower(first_page_no_query_string) ILIKE ANY ("%green-mountain%", "%cirro%", "%discount%", "%direct%", "%reliant%")
+        THEN 1 ELSE 0 END AS has_nrg_intent 
+  from energy_prod.energy.v_sessions s
+  CROSS JOIN cte_variables var
+  WHERE s.session_start_date_est between var.start_date and var.end_date -- s.date_utc >= var.start_date
+    AND s.bot_ip_ind = 0
+    AND s.is_bot = false
+    AND (s.is_internal_ip = 0 OR s.is_internal_ip IS NULL)
+    AND COALESCE(s.company_id, 25) = 25
+    AND s.first_page_url NOT ILIKE '%solar-energy%'
+    AND s.first_page_url NOT ILIKE '%resources%'
+    AND (s.non_texas_ind = 0 or s.campaign ilike '%a:SOE%')
+    AND (s.category IS NULL OR s.category != 'Non-Texas')
+    AND (LOWER(s.region) = 'tx' OR s.first_page_url ILIKE '%texas%' OR s.site_name NOT ILIKE '%chooseenergy%')
+)
+,
+
+-- =====================================================
+-- ==============  2. Base Cart Session Query  =========
+-- =====================================================
+cart_orders as (
+  select o.order_id,  
+    max(rev.gcv_new_v2) as order_gcv, 
+    max(o.partner_name) order_partner_name, 
+    max(o.product_name) order_product_name,
+    max(o.term) order_term_length, 
+    max(o.order_date_est) order_date_est, 
+    1 as cart_order
+  from energy_prod.energy.v_orders o
+  left join energy_prod.energy.v_orders_gcv rev ON o.order_id = rev.order_id
+  cross join cte_variables var
+  where o.order_date_est >= var.start_date
+    and (o.tenant_id != 'src_1ax2zVVJJ2cB9aBFEnVcRPog5Pe' OR o.tenant_id IS NULL)
+    and o.order_type = 'Cart'
+    and o.anonymous_id is not null
+  group by all
+)
+,
+
+cartsession_id_base as (
+  select c.*, co.*
+  from energy_prod.energy.v_carts c
+  left join cart_orders co on c.cartsession_id = co.order_id
+  cross join cte_variables var
+  where c.cartsession_start_date_utc >= var.start_date
+    --and c.tenant_id in ('ffc8ff8a-1975-4ec4-8d59-900718adb53d', '4b27d1c6-e19e-4cc0-add3-a44b9b4a4023')
+)
+
+, session_cart_counts as (
+  select
+      c.websession_id,
+      count(distinct c.cartsession_id) as cart_sessions_in_websession
+  from cartsession_id_base c
+  where c.cartsession_id is not null
+  group by 1
+), 
+
+-- =====================================================
+-- ==============  3. Pivot Logic   ===================
+-- =====================================================
+
+pivot_clicked as (
+  select fc.correlationId cart_instance_id, 1 pivot_clicked
+  from lakehouse_production.energy.event_redventures_usertracking_formcontinued fc
+  cross join cte_variables var
+  where fc.`_date` >= var.start_date
+    --and fc.`_tenant` in ('ffc8ff8a-1975-4ec4-8d59-900718adb53d', '4b27d1c6-e19e-4cc0-add3-a44b9b4a4023')
+    and fc.step_context_step_name in ('standard-pivot', 'prepaid-pivot','no-deposit-plans', 'credit-pivot')
+  group by 1
+
+  union
+
+  select pc.cartContext.cartInstanceId cart_instance_id, 1 pivot_clicked
+  from lakehouse_production.energy.event_redventures_cart_productclicked pc
+  cross join cte_variables var
+  where --pc.`_tenant` in ('ffc8ff8a-1975-4ec4-8d59-900718adb53d', '4b27d1c6-e19e-4cc0-add3-a44b9b4a4023') and
+    (pc.product_location ilike '%pivot%' or pc.product_location ilike 'no-deposit-plans')
+    and pc.`_date` >= var.start_date
+  group by 1
+  )
+,
+
+cart_instance_join as (
+  select cs.cart_instance_id, max(cs.cart_session_id) cart_session_id
+  from lakehouse_production.energy.event_redventures_cart_cartstarted cs
+  cross join cte_variables var
+  where cs.`_date` >= var.start_date
+    -- and cs.`_tenant` in ('ffc8ff8a-1975-4ec4-8d59-900718adb53d',
+    --         '4b27d1c6-e19e-4cc0-add3-a44b9b4a4023')
+  group by all
+)
+,
+
+pivot_click_final as (
+  select cij.cart_session_id, max(pvc.pivot_clicked) pivot_clicked
+  from cart_instance_join cij
+  inner join pivot_clicked pvc on pvc.cart_instance_id = cij.cart_instance_id
+  cross join cte_variables var
+  group by 1
+)
+,
+
+-- =====================================================
+-- ==============  4. Partner Qual   ===================
+-- =====================================================
+
+classified_errors AS (
+    SELECT
+        pe.client_session_id,
+        pe.session_id,
+        pe._timeStamp,
+        CASE
+            WHEN pe.externalId ILIKE '%fraud%'               THEN 'fraud'
+            WHEN pe.externalId ILIKE '%prior_balance%'       THEN 'balance'
+            WHEN pe.externalId ILIKE '%denied%'             THEN 'denied'
+            WHEN pe.externalId ILIKE '%payment%' 
+              OR pe.externalId ILIKE '%credit_card%'        THEN 'payment'
+            WHEN pe.externalId ILIKE '%invalid%'            THEN 'invalid'
+            WHEN pe.externalId ILIKE '%esiid%'              THEN 'esiid'
+            WHEN pe.externalId ILIKE '%exist%'              THEN 'prior_account'
+            WHEN pe.externalId ILIKE '%date%'               THEN 'unavailable_install'
+            WHEN pe.externalId ILIKE '%unable%'             THEN 'processing_error'
+            WHEN pe.externalId ILIKE '%authenticate%'       THEN 'authentication_error'
+            WHEN pe.externalId ILIKE '%server%'             THEN 'processing_error'
+            WHEN pe.externalId ILIKE '%account%'            THEN 'processing_error'
+            WHEN pe.externalId ILIKE '%servic%'             THEN 'prior_account'
+            WHEN pe.externalId ILIKE '%unknown%'            THEN 'unknown'
+            WHEN pe.externalId ILIKE '%error%'              THEN 'processing_error'
+            ELSE 'other'
+        END AS reason
+    FROM lakehouse_production.energy.event_energy_processerrored AS pe
+    cross join cte_variables var
+    WHERE pe._date >= var.start_date
+      AND pe.client_session_id NOT LIKE 'WR%'
+      AND pe.session_id IS NOT NULL
+      -- AND pe._tenant IN (
+      --     'ffc8ff8a-1975-4ec4-8d59-900718adb53d',
+      --     '4b27d1c6-e19e-4cc0-add3-a44b9b4a4023'
+      -- )
+),
+
+first_error_reason AS (
+  SELECT
+    client_session_id,
+    session_id,
+    reason AS first_qual_error_reason
+  FROM (
+    SELECT
+      ce.*,
+      ROW_NUMBER() OVER (
+        PARTITION BY ce.client_session_id, ce.session_id
+        ORDER BY ce.`_timeStamp` ASC
+      ) AS rn
+    FROM classified_errors ce
+  ) x
+  WHERE rn = 1
+),
+
+last_error_reason AS (
+  SELECT
+    client_session_id,
+    session_id,
+    reason AS last_qual_error_reason
+  FROM (
+    SELECT
+      ce.*,
+      ROW_NUMBER() OVER (
+        PARTITION BY ce.client_session_id, ce.session_id
+        ORDER BY ce.`_timeStamp` DESC
+      ) AS rn
+    FROM classified_errors ce
+  ) x
+  WHERE rn = 1
+),
+
+attempts AS (
+    SELECT
+        qr.client_session_id,
+        qr.web_session_id,
+        qr.response,
+        qr.providerName,
+        qr.step,
+        qr.`_timeStamp`,
+        -- Window function to find the earliest row *per client_session_id + step*
+        ROW_NUMBER() OVER (
+            PARTITION BY qr.client_session_id, qr.step
+            ORDER BY qr.`_timeStamp` ASC
+        ) AS rn
+    FROM lakehouse_production.energy.event_energy_qualificationresult qr
+    cross join cte_variables var
+    WHERE qr._date >= var.start_date
+      -- AND qr._tenant IN (
+      --     'ffc8ff8a-1975-4ec4-8d59-900718adb53d', 
+      --     '4b27d1c6-e19e-4cc0-add3-a44b9b4a4023'
+      -- )
+),
+
+first_midflow AS (
+    SELECT
+        client_session_id,
+        web_session_id,
+        response          AS midflow_response,
+        providerName      AS midflow_provider
+    FROM attempts
+    WHERE step = 'MID-FLOW' AND rn = 1
+),
+
+first_enrollment AS (
+    SELECT
+        client_session_id,
+        web_session_id,
+        response          AS enrollment_response,
+        providerName      AS enrollment_provider
+    FROM attempts
+    WHERE step = 'ENROLLMENT' AND rn = 1
+),
+
+agg_qual AS (
+    SELECT
+        qr.client_session_id,
+        qr.web_session_id,
+        SUM(CASE WHEN qr.response = 'FAILURE' THEN 1 ELSE 0 END) AS failures,
+        SUM(CASE WHEN qr.response = 'SUCCESS' THEN 1 ELSE 0 END) AS successes,
+        COLLECT_LIST(DISTINCT CASE WHEN qr.response = 'FAILURE' THEN qr.providerName END) AS providers_failed,
+        COLLECT_LIST(DISTINCT CASE WHEN qr.response = 'SUCCESS' THEN qr.providerName END) AS providers_passed,
+        MAX(CASE WHEN qr.priorDebt > 0 THEN 1 ELSE 0 END)       AS prior_debt,
+        MAX(CASE WHEN qr.deposit > 0 THEN 1 ELSE 0 END)         AS deposit_required,
+        COLLECT_LIST(DISTINCT qr.step)                          AS qual_step
+    FROM lakehouse_production.energy.event_energy_qualificationresult qr
+    cross join cte_variables var
+    WHERE qr._date >= var.start_date
+      -- AND qr._tenant IN (
+      --     'ffc8ff8a-1975-4ec4-8d59-900718adb53d',
+      --     '4b27d1c6-e19e-4cc0-add3-a44b9b4a4023'
+      -- )
+    GROUP BY all
+),
+
+qual_final as (
+  SELECT
+    -- Identify the session uniquely
+    COALESCE(fm.client_session_id, fe.client_session_id, aq.client_session_id) AS client_session_id,
+    COALESCE(fm.web_session_id,    fe.web_session_id,    aq.web_session_id)    AS web_session_id,
+
+    -- First MID-FLOW result
+    fm.midflow_response,
+    fm.midflow_provider,
+
+    -- First ENROLLMENT result
+    fe.enrollment_response,
+    fe.enrollment_provider,
+    case when fm.midflow_response = 'FAILURE' then 1 
+      when fe.enrollment_response = 'FAILURE' then 1 
+      else 0 end as qual_fail,
+
+    -- Aggregation
+    aq.failures as qual_failures,
+    aq.successes as qual_successes,
+    aq.providers_failed as providers_failed_qual,
+    aq.providers_passed as providers_passed_qual,
+    aq.prior_debt,
+    aq.deposit_required,
+    aq.qual_step,
+
+    -- All distinct reasons for errors in that session
+    COLLECT_LIST(DISTINCT ce.reason) AS error_reasons,
+    fer.first_qual_error_reason,
+    ler.last_qual_error_reason
+
+  FROM first_midflow fm
+  FULL JOIN first_enrollment fe
+        ON fm.client_session_id = fe.client_session_id
+        AND fm.web_session_id    = fe.web_session_id
+  LEFT JOIN agg_qual aq
+        ON COALESCE(fm.client_session_id, fe.client_session_id) = aq.client_session_id
+        AND COALESCE(fm.web_session_id,    fe.web_session_id)    = aq.web_session_id
+  LEFT JOIN classified_errors ce
+        ON COALESCE(fm.client_session_id, fe.client_session_id) = ce.client_session_id
+  LEFT JOIN first_error_reason fer
+        ON COALESCE(fm.client_session_id, fe.client_session_id) = fer.client_session_id
+        AND COALESCE(fm.web_session_id,    fe.web_session_id)    = fer.session_id
+  LEFT JOIN last_error_reason ler
+        ON COALESCE(fm.client_session_id, fe.client_session_id) = ler.client_session_id
+        AND COALESCE(fm.web_session_id,    fe.web_session_id)    = ler.session_id
+
+  GROUP BY all
+)
+,
+
+-- =====================================================
+-- ==============  5. Credit Check Run   ===================
+-- =====================================================
+
+FirstCreditRunCalc AS (
+  SELECT
+    cr.client_session_id,
+    cr._timeStamp AS sent_at,
+    cr.creditScore,
+    cr.creditRunId,
+    cr.providerName,
+    case when cr.passSelectedThreshold = true then 'pass'
+      when cr.passSelectedThreshold = false then 'fail'
+      else 'other' end AS provider_pass,
+    ROW_NUMBER() OVER (PARTITION BY cr.client_session_id ORDER BY cr._timeStamp ASC) AS rn
+  FROM lakehouse_production.energy.event_energy_creditresult cr
+  cross join cte_variables var
+  WHERE cr._date >= var.start_date
+    and cr.client_session_id not like 'WR%' 
+    and cr.web_session_id is not null
+    --and cr.`_tenant` in ('ffc8ff8a-1975-4ec4-8d59-900718adb53d', '4b27d1c6-e19e-4cc0-add3-a44b9b4a4023')
+),
+
+first_credit_run as (
+SELECT
+  client_session_id,
+  creditScore first_run_credit_score,
+  providerName first_run_provider_name,
+  provider_pass first_run_provider_pass
+FROM FirstCreditRunCalc
+WHERE rn = 1),
+
+agged_credit_run as (
+  select cr.client_session_id,
+    min(cr.`_timeStamp`) sent_at,
+    collect_list(distinct cr.creditScore) unique_scores,
+    max(cr.creditScore) max_score,
+    count(distinct cr.creditRunId) credit_runs,
+    max(size(array_distinct (cr.providerFailed))) providers_failed,
+    max(size(array_distinct (cr.providerPassed))) providers_passed,
+    max(case when cr.passLowestThreshold = true then 1 else 0 end) ucc_pass,
+    max(case when cr.passSelectedThreshold = true then 1 else 0 end) provider_pass
+  from lakehouse_production.energy.event_energy_creditresult cr
+  cross join cte_variables var
+  where cr.`_date` >= var.start_date
+    and cr.client_session_id not like 'WR%' 
+    and cr.web_session_id is not null
+    --and cr.`_tenant` in ('ffc8ff8a-1975-4ec4-8d59-900718adb53d', '4b27d1c6-e19e-4cc0-add3-a44b9b4a4023')
+  group by all
+),
+
+final_credit_run as (
+  select fcr.client_session_id
+    , first_run_credit_score
+    , first_run_provider_name
+    , first_run_provider_pass
+    , case when fcr.first_run_provider_pass = 'fail' then 1 else 0 end credit_fail
+    , acr.unique_scores as unique_credit_scores
+    , acr.max_score as max_credit_score
+    , acr.credit_runs
+    , acr.providers_failed as providers_failed_credit
+    , acr.providers_passed as providers_passed_credit
+    , acr.ucc_pass as ucc_pass_credit
+  from first_credit_run fcr
+  left join agged_credit_run acr on fcr.client_session_id = acr.client_session_id
+),
+
+-- =====================================================
+-- ==============  6. Volt Failures   ==================
+-- =====================================================
+first_fail AS (
+    -- For each session, pick the earliest row by _timeStamp
+    SELECT
+        vf.sessionId,
+        vf.voltStepFailed    AS first_fail_reason,
+        ROW_NUMBER() OVER (
+            PARTITION BY vf.sessionId
+            ORDER BY vf._timeStamp ASC
+        ) AS rn
+    FROM lakehouse_production.energy.event_energy_voltfailure vf
+    cross join cte_variables var
+    WHERE vf._date >= var.start_date
+      AND vf.sessionId IS NOT NULL
+      -- AND vf._tenant IN (
+      --       'ffc8ff8a-1975-4ec4-8d59-900718adb53d',
+      --       '4b27d1c6-e19e-4cc0-add3-a44b9b4a4023'
+      -- )
+)
+,
+
+agg_fail AS (
+    -- For each session, sum up the occurrences of Negative List failures or SEON failures
+    SELECT
+        vf.sessionId,
+        SUM(CASE WHEN vf.voltStepFailed = 'Negative List' THEN 1 ELSE 0 END) AS negative_list_fail_count,
+        SUM(CASE WHEN vf.voltStepFailed = 'SEON' THEN 1 ELSE 0 END)          AS seon_fail_count
+    FROM lakehouse_production.energy.event_energy_voltfailure vf
+    cross join cte_variables var
+    WHERE vf._date >= var.start_date
+      AND vf.sessionId IS NOT NULL
+      -- AND vf._tenant IN (
+      --       'ffc8ff8a-1975-4ec4-8d59-900718adb53d',
+      --       '4b27d1c6-e19e-4cc0-add3-a44b9b4a4023'
+      -- )
+    GROUP BY vf.sessionId
+)
+,
+
+volt_fail as (
+  SELECT
+      ff.sessionId as client_session_id,
+      ff.first_fail_reason,
+      af.negative_list_fail_count,
+      af.seon_fail_count,
+      1 volt_fail
+  FROM first_fail ff
+  JOIN agg_fail af 
+      ON ff.sessionId = af.sessionId
+  WHERE ff.rn = 1  -- only keep the earliest failure per session
+  order by 4 ASC, 5 ASC
+)
+,
+
+-- =====================================================
+-- ==============  7. Cart Step Completions  ===========
+-- =====================================================
+step_completions as (
+  select cartsession_id_completions, 
+    max(page_1_completion) page_1_completion,
+    max(customer_info_completion) customer_info_completion,
+    max(ssn_completion) ssn_completion
+  from (
+    select
+      fc2.order_session_id cartsession_id_completions,
+      max(case when fc2.cartContext_pageReferrer ilike '%mover-switcher%' then 1 end) AS page_1_completion, --- I dont actually think this page is the one that would suggest that the person finished this page
+      max(case when formContext.formName = 'PersonalInfo' then 1 end) AS customer_info_completion,
+      max(case when formContext.formName = 'CreditVerification' then 1 end) AS ssn_completion
+    from lakehouse_production.energy.event_redventures_cart_formcontinued fc2
+    cross join cte_variables var
+
+    where _date > var.start_date
+      --and fc2.`_tenant` in ('ffc8ff8a-1975-4ec4-8d59-900718adb53d', '4b27d1c6-e19e-4cc0-add3-a44b9b4a4023')
+    group by all
+
+    union
+
+    select cs.cart_session_id cartsession_id_completions,
+      max(case when fc3.step_context_step_name = 'connection-info' then 1 end) as page_1_completion, -- should this encompass contact-info
+      max(case when fc3.step_context_step_name = 'contact-info' then 1 end) AS customer_info_completion, -- will everyone who inputs this actually have this event fire?
+      max(case when fc3.step_context_step_name = 'credit-verification' then 1 end) AS ssn_completion -- will there be some of things like qualification that would fill in here?
+    from lakehouse_production.energy.event_redventures_usertracking_formcontinued fc3
+    inner join (select cart_instance_id, max(cart_session_id) cart_session_id
+            from lakehouse_production.energy.event_redventures_cart_cartstarted group by all) cs
+              on cs.cart_instance_id = fc3.correlationId
+    cross join cte_variables var
+
+    where fc3.form_context_form_name = 'Cart' 
+      and  _date > var.start_date
+      --and fc3.`_tenant` in ('ffc8ff8a-1975-4ec4-8d59-900718adb53d', '4b27d1c6-e19e-4cc0-add3-a44b9b4a4023')
+    group by all
+  )
+  group by all
+)
+,
+
+-- =====================================================
+-- ==============  8. Address + Appointment Selected   ===========
+-- =====================================================
+address_captured as (
+  select *, 1 address_captured
+  from (
+    select ac.process_id as address_process_id
+      , ac.isApartment
+      , ac.sender_id
+      , ac.`_timeStamp`
+      , row_number() over (partition by ac.process_id order by ac.`_timeStamp` desc) as rn
+    from lakehouse_production.energy.event_energy_addresscaptured ac
+    cross join cte_variables var
+    where _date > var.start_date
+      --and ac.`_tenant` in ('ffc8ff8a-1975-4ec4-8d59-900718adb53d', '4b27d1c6-e19e-4cc0-add3-a44b9b4a4023') 
+      and ac.process_id not like 'WR%' 
+      --and ac.sender_id like '%cart%'
+  ) z
+  where z.rn = 1
+)
+,
+
+appointment_selected as (
+  select *, 1 as appointment_selected
+  from (
+      select  aps.process_id as appt_process_id, 
+        aps.appointmentDate, 
+        aps.appointmentType,
+        aps.sender_id,
+        row_number() over (partition by aps.process_id order by aps.`_timeStamp` desc) as rn
+      from lakehouse_production.energy.event_energy_appointmentselected aps
+      cross join cte_variables var
+      where _date > var.start_date
+        --and aps.`_tenant` in ('ffc8ff8a-1975-4ec4-8d59-900718adb53d', '4b27d1c6-e19e-4cc0-add3-a44b9b4a4023') 
+        and aps.process_id not like 'WR%' 
+        and aps.sender_id like '%cart%'
+  ) z
+  where z.rn = 1
+  group by all
+)
+,
+
+review_page as (
+  select cartsession_id_review
+    , max(clicked_review_page_cta) clicked_review_page_cta
+  from (
+    select cs.cart_session_id cartsession_id_review, 
+      max(case when fc.cartcontext.pagereferrer ilike '%review%' then 1 else null end) AS clicked_review_page_cta
+    from lakehouse_production.energy.event_redventures_cart_formsubmitted fc
+    join (select cart_instance_id, max(cart_session_id) cart_session_id
+            from lakehouse_production.energy.event_redventures_cart_cartstarted group by all) cs on fc.cart_instance_id = cs.cart_instance_id
+    cross join cte_variables var
+    where fc._date > var.start_date
+      --and fc.`_tenant` in ('ffc8ff8a-1975-4ec4-8d59-900718adb53d', '4b27d1c6-e19e-4cc0-add3-a44b9b4a4023')
+    group by all
+
+    union 
+
+    select cs.cart_session_id cartsession_id_review,
+        max(case when fc3.step_context_step_name = 'review' then 1 else null end) AS clicked_review_page_cta -- should this also include the enrollment button push?
+      from lakehouse_production.energy.event_redventures_usertracking_formcontinued fc3
+      join (select cart_instance_id, max(cart_session_id) cart_session_id
+              from lakehouse_production.energy.event_redventures_cart_cartstarted group by all) cs
+                on cs.cart_instance_id = fc3.correlationId
+      cross join cte_variables var
+      where fc3.form_context_form_name = 'Cart' 
+        and  _date > var.start_date
+        --and fc3.`_tenant` in ('ffc8ff8a-1975-4ec4-8d59-900718adb53d', '4b27d1c6-e19e-4cc0-add3-a44b9b4a4023')
+      group by all
+  )
+  group by all
+)
+,
+
+pivot_errors AS (
+  SELECT 
+    1 AS pivot_triggered_allin,
+    integration_context_client_session_id, 
+
+    -- Existing aggregations
+    array_sort(collect_set(errorType))   AS errorTypes,
+    array_sort(collect_set(cartVersion)) AS PivotCartVersions,
+
+    -- First pivot result by timestamp
+    min_by(errorType, _timestamp) AS first_pivot_result,
+
+    -- Last pivot result by timestamp
+    max_by(errorType, _timestamp) AS last_pivot_result
+
+  FROM lakehouse_production.energy.event_energy_pivotresult
+  CROSS JOIN cte_variables var
+  WHERE _date >= var.start_date
+    AND cartVersion IS NOT NULL
+  GROUP BY integration_context_client_session_id
+)
+,
+
+-- ===== 2.6 Cart Through ROG? =====
+rogs_indicator as (
+  SELECT 
+    session_id,
+    MAX(CASE 
+      WHEN webElement.elementType = 'Cart CTA' 
+        AND webElement.location = 'ROG' 
+        AND webElement.text = 'Check Availability' 
+      THEN 1 
+      ELSE 0 
+    END) as rogs_ind
+  FROM lakehouse_production.energy.event_redventures_usertracking_elementclicked
+  CROSS JOIN cte_variables var
+  WHERE _date > var.start_date
+  GROUP BY session_id
+),
+
+-- =====================================================
+-- ======9. Cart Entry Point   =========================
+-- =====================================================
+-- Raw product clicked events
+ cart_entry_point AS (
+  SELECT
+    pc._anonymousId,
+    pc.product_product_id,
+    pc.product_location,
+    pc.product_position,
+    pc.product_format_type,
+    pc._timeStamp AS click_ts
+  FROM lakehouse_production.energy.event_redventures_ecommerce_productclicked pc
+  CROSS JOIN cte_variables var
+  WHERE pc._date >= var.start_date
+),
+
+-- Bridge table: productadded gives us cart_session_id
+  product_added_bridge AS (
+  SELECT
+    pa.cart_session_id,
+    pa.product_id,
+    pa._anonymousId,
+    pa._timeStamp AS added_ts,
+    pa.page_referrer,
+    CASE
+      WHEN pa.page_referrer ILIKE '%referrer=%'
+          THEN SPLIT_PART(SPLIT_PART(pa.page_referrer, 'referrer=', 2), '&', 1)
+      WHEN pa.page_referrer ILIKE '%lead_src=%'
+          THEN SPLIT_PART(SPLIT_PART(pa.page_referrer, 'lead_src=', 2), '&', 1)
+      ELSE pa.page_referrer
+    END AS extracted_referrer
+  FROM lakehouse_production.energy.event_redventures_cart_productadded pa
+  CROSS JOIN cte_variables var
+  WHERE pa._date >= var.start_date
+),
+
+-- Join clicked → added on product_id + anonymous_id,
+-- then dedup to one click per cart session (most recent click before the add)
+click_to_cart AS (
+  SELECT
+    pab.cart_session_id,
+    pab.extracted_referrer,
+    cep.product_location,
+    cep.product_position,
+    cep.product_format_type,
+    cep.click_ts,
+    ROW_NUMBER() OVER (
+      PARTITION BY pab.cart_session_id
+      ORDER BY cep.click_ts DESC
+    ) AS rn
+  FROM product_added_bridge pab
+  INNER JOIN cart_entry_point cep
+    ON cep.product_product_id = pab.product_id
+    AND cep._anonymousId = pab._anonymousId
+    AND cep.click_ts <= pab.added_ts
+),
+
+ first_product_added AS (
+    SELECT
+        x.cart_session_id,
+        x.product_id      AS first_product_id,
+        x.added_ts        AS first_added_ts,
+        x.page_referrer,
+        x.extracted_referrer, 
+        CASE
+          WHEN x.extracted_referrer ILIKE '%electricity-rates%'
+            OR x.extracted_referrer ILIKE '%electricity-providers%'
+            OR x.extracted_referrer ILIKE '%electric-utilities%'
+            OR x.extracted_referrer ILIKE '%same-day-electricity%'
+            OR x.extracted_referrer ILIKE '%energy-resources%'
+          THEN 'RatesTable'
+        END AS product_location2
+    FROM (
+        SELECT
+            pab.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY pab.cart_session_id
+                ORDER BY pab.added_ts ASC
+            ) AS rn_first
+        FROM product_added_bridge pab
+    ) x
+    WHERE x.rn_first = 1
+),
+
+-- =====================================================
+-- ======10. Grid JO Sessions   ========================
+-- =====================================================
+ grid_jo_sessions AS 
+(SELECT d.sessionId, 
+    CASE WHEN CAST(d.isHoldout AS STRING) = 'true' THEN 'Holdout' ELSE 'Model' END AS isHoldout,  
+    CASE
+      WHEN d.optionSelected = 'sourceId#b3a53a7a-293b-4147-b3e1-6e2a15b99554##experience#experienceId#e409999d-a572-499f-8666-9a117b732e31' THEN 'BAU'
+      WHEN d.optionSelected = 'sourceId#b3a53a7a-293b-4147-b3e1-6e2a15b99554##experience#experienceId#5a7764ca-2c4f-40c6-ae9b-1c41b6c8319f' THEN 'Quick Decision'
+      WHEN d.optionSelected = 'sourceId#b3a53a7a-293b-4147-b3e1-6e2a15b99554##experience#experienceId#9d928450-b1aa-4077-a409-7917f9d75c9b' THEN 'Cost Conscious V2'
+      WHEN d.optionSelected = 'sourceId#b3a53a7a-293b-4147-b3e1-6e2a15b99554##experience#experienceId#d8c563dd-f796-4f02-b8ea-570a2f917c75' THEN 'Info Seeker'
+      ELSE 'other'
+    END AS grid_jo_experience
+FROM lakehouse_production.energy.dapi_decisions d
+WHERE d.agentId = 3401 AND (result IN ('SUCCESS','FAILURE') OR result IS NULL)) 
+
+
+-- =====================================================
+-- ====== FINAL OUTPUT =================================
+-- =====================================================
+, cte_final_output as (
+SELECT
+
+  -- 1. Session Information 
+    DATE(s.session_start_date_est)                            AS _date,
+    HOUR(s.session_start_ts_est)                              AS hour,
+    DATE_FORMAT(s.session_start_date_est, 'EEEE')             AS day_of_week,
+    DAY(s.session_start_date_est)                             AS day_of_month
+
+  , s.mover_switcher
+  , s.utility_area
+  , s.marketing_channel
+  , s.device_type
+  , s.site_name
+  , s.first_page_url
+  , s.webcontext_session_id
+  , s.first_page_no_query_string
+  , s.landing_page_type
+  , CASE 
+      WHEN s.landing_page_type = 'Provider' 
+        THEN REGEXP_EXTRACT(first_page_no_query_string, '(providers|electricity-providers)/([^/]+)', 2)
+      WHEN s.landing_page_type = 'Utilities'
+        THEN REGEXP_EXTRACT(first_page_no_query_string, 'electric-utilities/([^/]+)', 1)
+      END AS slug
+  , s.zip_entry 
+  , s.has_nrg_intent
+  , s.campaign_bucket
+
+  -- 2. Cart Level Information + Orders 
+    -- Cart Info 
+  , c.cartsession_id  
+  , case when c.cartsession_id is not null then 1 else 0 end as cart_entry
+  , c.last_page_url
+  ,  CASE 
+        WHEN last_page_url ILIKE '%compare-offers%' THEN 'CartEntry_Grid'
+        WHEN last_page_url ILIKE 'https://www.choosetexaspower.org/electricity-rates%' THEN 'CartEntry_RateTable'
+        ELSE NULL END AS cartentry_source 
+  , c.first_partner_name
+  , c.first_product_name
+  , c.last_partner_name
+  , c.last_product_name
+  , CASE WHEN c.first_product_name != c.last_product_name THEN 1 ELSE 0 END as switched_product_mid_cart 
+  , coalesce(scc.cart_sessions_in_websession, 0) as cart_sessions_in_websession
+  , case when coalesce(scc.cart_sessions_in_websession, 0) > 1 then 1 else 0 end as multi_cart_entry_ind
+
+    -- Orders 
+  , c.order_gcv
+  , c.order_partner_name
+  , c.order_product_name
+  , c.order_date_est
+  , c.cart_order 
+
+  
+  -- 4. Partner Qual Information
+    -- First MID-FLOW qual result
+  , qf.midflow_response
+  , qf.midflow_provider
+
+    -- First ENROLLMENT qual result
+  , qf.enrollment_response
+  , qf.enrollment_provider
+
+    -- qual
+  , qf.qual_fail  
+  , qf.qual_failures
+  , qf.qual_successes
+  , qf.providers_failed_qual
+  , qf.providers_passed_qual
+  , qf.prior_debt
+  , qf.deposit_required 
+  , qf.qual_step
+
+    -- qual errors
+  , qf.error_reasons
+  , qf.first_qual_error_reason
+  , qf.last_qual_error_reason
+
+
+
+  -- 5. Credit Check Run 
+  , fcr.credit_runs
+  , fcr.first_run_credit_score
+  , fcr.first_run_provider_name
+  , fcr.first_run_provider_pass
+  , fcr.credit_fail
+  , fcr.max_credit_score
+  , case 
+      when fcr.max_credit_score = 0 then '0'
+      when  fcr.max_credit_score between 1 and 499 then '1-500'
+      when  fcr.max_credit_score between 500 and 549 then '500-550'
+      when fcr.max_credit_score between 550 and 599 then '550-600'
+      when fcr.max_credit_score between 600 and 649 then '600-650'
+      when fcr.max_credit_score between 650 and 699 then '650-700'
+      when fcr.max_credit_score between 700 and 749 then '700-750'
+      when fcr.max_credit_score between 750 and 799 then '750-800'
+      when fcr.max_credit_score between 800 and 849 then '800-850'
+      when fcr.max_credit_score >= 850 then '850 and above'
+    end as CreditScoreBucketCR
+  , fcr.providers_failed_credit
+  , fcr.providers_passed_credit
+  , fcr.ucc_pass_credit
+  
+  -- 6. Volt Fail Reasons
+  , v.volt_fail 
+  , v.first_fail_reason as volt_first_fail_reason
+  , v.negative_list_fail_count
+  , v.seon_fail_count
+
+  -- 7. Cart Step Completions 
+  , sc.page_1_completion
+  , sc.customer_info_completion
+  , sc.ssn_completion 
+
+  -- 8. Address and Appointment Selected + Review Page Reached 
+  , ac.address_captured
+  , app.appointment_selected
+  , rev.clicked_review_page_cta
+
+
+  -- 3. Pivot Information
+  , case when volt_fail > 0 then 1
+         when credit_fail > 0 then 1
+         when qual_fail > 0 then 1 else 0 end volt_credit_qual_pivot
+  , pcf.pivot_clicked
+  , case when pivot_clicked > 0 and cart_order > 0 then 1 else 0 end pivot_order
+  , pe.pivot_triggered_allin as pivot_triggered
+  , pe.errorTypes
+  , pe.first_pivot_result
+  , pe.last_pivot_result
+  , pe.pivotcartversions
+
+  , COALESCE(ri.rogs_ind, 0) as rogs_ind
+
+  , ctc.product_location
+  , fpa.extracted_referrer
+  , fpa.product_location2
+  , CASE
+      WHEN ctc.product_location IS NOT NULL THEN ctc.product_location
+      WHEN fpa.product_location2 IS NOT NULL THEN fpa.product_location2
+      ELSE 'Unknown'
+    END AS cart_entry_point
+
+    -- 9. Grid JO Info 
+    , gjs.isHoldout
+    , gjs.grid_jo_experience
+
+  from base_sessions s
+  left join cartsession_id_base c on c.websession_id = s.webcontext_session_id
+  left join pivot_click_final pcf on pcf.cart_session_id = c.cartsession_id
+  left join qual_final qf on qf.client_session_id = c.cartsession_id
+  left join final_credit_run fcr on fcr.client_session_id = c.cartsession_id
+  left join volt_fail v on v.client_session_id = c.cartsession_id
+  left join step_completions sc on sc.cartsession_id_completions = c.cartsession_id
+  left join address_captured ac on ac.address_process_id = c.cartsession_id
+  left join appointment_selected app on app.appt_process_id = c.cartsession_id
+  left join review_page rev on rev.cartsession_id_review = c.cartsession_id
+  left join pivot_errors pe on pe.integration_context_client_session_id = c.cartsession_id
+  left join rogs_indicator ri ON ri.session_id = s.webcontext_session_id
+  left join session_cart_counts scc on scc.websession_id = s.webcontext_session_id
+  left join click_to_cart ctc on ctc.cart_session_id = c.cartsession_id and ctc.rn = 1
+  left join first_product_added fpa on fpa.cart_session_id = c.cartsession_id
+  left join grid_jo_sessions gjs ON gjs.sessionId = s.webcontext_session_id
+)
+
+select *
+from cte_final_output

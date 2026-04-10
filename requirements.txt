@@ -6,3 +6,6 @@ streamlit
 plotly
 certifi
 openai
+apscheduler
+kaleido
+requests
