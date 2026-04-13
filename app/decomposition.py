@@ -309,4 +309,10 @@ def compute_initiative_impact(
             "scaled_impact_on_kpi": scaled_impact,
         })
 
-    return pd.DataFrame(rows).sort_values("scaled_impact_on_kpi", ascending=False)
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return pd.DataFrame(columns=[
+            "initiative", "model_rate", "holdout_rate", "lift",
+            "model_sessions", "model_share", "scaled_impact_on_kpi",
+        ])
+    return result.sort_values("scaled_impact_on_kpi", ascending=False)

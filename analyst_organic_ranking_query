@@ -1,0 +1,345 @@
+WITH TexasState AS (
+  SELECT
+    ROUND(AVG(organic_results_true_rank), 2) AS AVG_TRUE_RANK,
+    ROUND(AVG(organic_results_web_rank), 2) AS AVG_WEB_RANK,
+    organic_results_link,
+    date,
+    'Texas' AS page,
+    organic_results_link_domain AS Website,
+    SUM(avg_search_volume) AS SearchVolume,
+    COUNT(DISTINCT CASE WHEN organic_results_web_rank <= 10 THEN keyword_tracked END) AS KeywordsInTop10,
+    ROUND(
+      SUM(
+        organic_results_web_rank * CASE
+          WHEN avg_search_volume = 99 THEN 0
+          ELSE avg_search_volume
+        END
+      ) * 1.0
+      / NULLIF(
+        SUM(
+          CASE
+            WHEN avg_search_volume = 99 THEN 0
+            ELSE avg_search_volume
+          END
+        ),
+        0
+      ),
+      2
+    ) AS weighted_average_rank
+  FROM lakehouse_production.common.seo_fact_clarity_keywords_rankings_json
+  WHERE keyword_tags ILIKE '%SoV_Texas_State%'
+    AND date >= '2025-12-01'
+    AND organic_results_link IN (
+      'https://www.chooseenergy.com/electricity-rates/texas/',
+      'https://www.saveonenergy.com/electricity-rates/texas/',
+      'https://www.choosetexaspower.org/electricity-rates/'
+    )
+    AND organic_results_link NOT ILIKE '%staging%'
+    AND device = 'mobile'
+    AND organic_results_link NOT ILIKE '%2%'
+    AND location_requested IN (
+      'Houston, TX, USA',
+      'Arlington, TX, USA',
+      'Dallas, TX, USA',
+      'Corpus Christi, TX, USA',
+      'Fort Worth, TX, USA',
+      'Plano, TX',
+      'Lubbock, TX, USA'
+    )
+    AND keyword_tracked IN (
+      'electric rates texas',
+      'electricity rates in texas',
+      'texas energy rates',
+      'texas electricity rates',
+      'energy rates texas',
+      'energy rates in texas',
+      'cheapest electricity in texas',
+      'cheap electricity texas',
+      'cheap electricity in texas',
+      'best electricity rates in texas',
+      'best electric rates in texas',
+      'best energy rates in texas',
+      'cheapest electricity rates in texas',
+      'lowest electric rates in texas',
+      'best energy plans in texas',
+      'who has the cheapest electricity rates in texas',
+      'power plans',
+      'cheap power'
+    )
+  GROUP BY 3, 4, 5, 6
+),
+
+CitySpecific AS (
+  SELECT
+    ROUND(AVG(organic_results_true_rank), 2) AS AVG_TRUE_RANK,
+    ROUND(AVG(organic_results_web_rank), 2) AS AVG_WEB_RANK,
+    organic_results_link,
+    date,
+    CASE
+      WHEN keyword_tags ILIKE '%2.SoV_Dallas%'
+        AND location_requested ILIKE '%Dallas%'
+        AND organic_results_link IN (
+          'https://www.chooseenergy.com/electricity-rates/texas/dallas/',
+          'https://www.choosetexaspower.org/electricity-rates/dallas/'
+        ) THEN 'Dallas'
+      WHEN keyword_tags ILIKE '%2.SoV_Fort_Worth%'
+        AND location_requested ILIKE '%Fort Worth%'
+        AND organic_results_link = 'https://www.choosetexaspower.org/electricity-rates/fort-worth/' THEN 'Fort Worth'
+      WHEN keyword_tags ILIKE '%2.SoV_Houston%'
+        AND location_requested ILIKE '%Houston%'
+        AND organic_results_link IN (
+          'https://www.chooseenergy.com/electricity-rates/texas/houston/',
+          'https://www.choosetexaspower.org/electricity-rates/houston/',
+          'https://www.saveonenergy.com/electricity-rates/texas/houston/'
+        ) THEN 'Houston'
+    END AS Page,
+    organic_results_link_domain AS Website,
+    SUM(avg_search_volume) AS SearchVolume,
+    COUNT(CASE WHEN organic_results_web_rank <= 10 THEN keyword_tracked END) AS KeywordsInTop10,
+    ROUND(
+      SUM(
+        organic_results_web_rank * CASE
+          WHEN avg_search_volume = 99 THEN 0
+          ELSE avg_search_volume
+        END
+      ) * 1.0
+      / NULLIF(
+        SUM(
+          CASE
+            WHEN avg_search_volume = 99 THEN 0
+            ELSE avg_search_volume
+          END
+        ),
+        0
+      ),
+      2
+    ) AS weighted_average_rank
+  FROM lakehouse_production.common.seo_fact_clarity_keywords_rankings_json
+  WHERE keyword_tags IS NOT NULL
+    AND location_requested IS NOT NULL
+    AND organic_results_link IS NOT NULL
+    AND (
+      (keyword_tags ILIKE '%2.SoV_Dallas%' AND location_requested ILIKE '%Dallas%')
+      OR (keyword_tags ILIKE '%2.SoV_Fort_Worth%' AND location_requested ILIKE '%Fort Worth%')
+      OR (keyword_tags ILIKE '%2.SoV_Houston%' AND location_requested ILIKE '%Houston%')
+    )
+    AND organic_results_link IN (
+      'https://www.choosetexaspower.org/electricity-rates/houston/',
+      'https://www.choosetexaspower.org/electricity-rates/dallas/',
+      'https://www.choosetexaspower.org/electricity-rates/fort-worth/',
+      'https://www.chooseenergy.com/electricity-rates/texas/houston/',
+      'https://www.chooseenergy.com/electricity-rates/texas/dallas/',
+      'https://www.saveonenergy.com/electricity-rates/texas/houston/'
+    )
+    AND device = 'mobile'
+    AND date >= '2025-12-01'
+  GROUP BY 3, 4, 5, 6
+),
+
+P2C AS (
+  SELECT
+    ROUND(AVG(organic_results_true_rank), 2) AS AVG_TRUE_RANK,
+    ROUND(AVG(organic_results_web_rank), 2) AS AVG_WEB_RANK,
+    organic_results_link,
+    date,
+    'P2C' AS Page,
+    organic_results_link_domain AS Website,
+    SUM(avg_search_volume) AS SearchVolume,
+    COUNT(CASE WHEN organic_results_web_rank <= 10 THEN keyword_tracked END) AS KeywordsInTop10,
+    ROUND(
+      SUM(
+        organic_results_web_rank * CASE
+          WHEN avg_search_volume = 99 THEN 0
+          ELSE avg_search_volume
+        END
+      ) * 1.0
+      / NULLIF(
+        SUM(
+          CASE
+            WHEN avg_search_volume = 99 THEN 0
+            ELSE avg_search_volume
+          END
+        ),
+        0
+      ),
+      2
+    ) AS weighted_average_rank
+  FROM lakehouse_production.common.seo_fact_clarity_keywords_rankings_json
+  WHERE keyword_tags ILIKE '%Texas_Power_to_Choose%'
+    AND date >= '2025-12-01'
+    AND organic_results_link = 'https://www.choosetexaspower.org/'
+    AND organic_results_link NOT ILIKE '%staging%'
+    AND organic_results_link NOT ILIKE '%2%'
+    AND device = 'mobile'
+    AND location_requested IN (
+      'Houston, TX, USA',
+      'Arlington, TX, USA',
+      'Dallas, TX, USA',
+      'Corpus Christi, TX, USA',
+      'Fort Worth, TX, USA',
+      'Plano, TX',
+      'Lubbock, TX, USA'
+    )
+    AND keyword_tracked IN (
+      'power to choose',
+      'texas power',
+      'power2choose',
+      'power to choose electricity',
+      'power to choose texas',
+      'choose power in texas',
+      'choose power texas',
+      'power to choose texas electricity rates',
+      'power to choose electricity plans texas'
+    )
+  GROUP BY 3, 4, 5, 6
+),
+
+BestProviders AS (
+  SELECT
+    ROUND(AVG(organic_results_true_rank), 2) AS AVG_TRUE_RANK,
+    ROUND(AVG(organic_results_web_rank), 2) AS AVG_WEB_RANK,
+    organic_results_link,
+    date,
+    'BestProviders' AS Page,
+    organic_results_link_domain AS Website,
+    SUM(avg_search_volume) AS SearchVolume,
+    COUNT(CASE WHEN organic_results_web_rank <= 10 THEN keyword_tracked END) AS KeywordsInTop10,
+    ROUND(
+      SUM(
+        organic_results_web_rank * CASE
+          WHEN avg_search_volume = 99 THEN 0
+          ELSE avg_search_volume
+        END
+      ) * 1.0
+      / NULLIF(
+        SUM(
+          CASE
+            WHEN avg_search_volume = 99 THEN 0
+            ELSE avg_search_volume
+          END
+        ),
+        0
+      ),
+      2
+    ) AS weighted_average_rank
+  FROM lakehouse_production.common.seo_fact_clarity_keywords_rankings_json
+  WHERE keyword_tags ILIKE '%SoV_Provider_General%'
+    AND date >= '2025-12-01'
+    AND device = 'mobile'
+    AND organic_results_link = 'https://www.choosetexaspower.org/electricity-providers/'
+    AND keyword_tracked IN (
+      'texas electricity providers',
+      'texas energy providers',
+      'electric providers in texas',
+      'best energy companies in texas',
+      'light companies in texas',
+      'texas energy companies',
+      'electricity providers',
+      'texas power companies',
+      'best electric company'
+    )
+    AND location_requested IN (
+      'Houston, TX, USA',
+      'Arlington, TX, USA',
+      'Dallas, TX, USA',
+      'Corpus Christi, TX, USA',
+      'Fort Worth, TX, USA',
+      'Plano, TX',
+      'Lubbock, TX, USA'
+    )
+  GROUP BY 3, 4, 5, 6
+),
+
+NoDeposit AS (
+  SELECT
+    ROUND(AVG(organic_results_true_rank), 2) AS AVG_TRUE_RANK,
+    ROUND(AVG(organic_results_web_rank), 2) AS AVG_WEB_RANK,
+    organic_results_link,
+    date,
+    'NoDeposit' AS Page,
+    organic_results_link_domain AS Website,
+    SUM(avg_search_volume) AS SearchVolume,
+    COUNT(CASE WHEN organic_results_web_rank <= 10 THEN keyword_tracked END) AS KeywordsInTop10,
+    ROUND(
+      SUM(
+        organic_results_web_rank * CASE
+          WHEN avg_search_volume = 99 THEN 0
+          ELSE avg_search_volume
+        END
+      ) * 1.0
+      / NULLIF(
+        SUM(
+          CASE
+            WHEN avg_search_volume = 99 THEN 0
+            ELSE avg_search_volume
+          END
+        ),
+        0
+      ),
+      2
+    ) AS weighted_average_rank
+  FROM lakehouse_production.common.seo_fact_clarity_keywords_rankings_json
+  WHERE keyword_tags ILIKE '%SoV_Texas_No_Deposit%'
+    AND date >= '2025-12-01'
+    AND device = 'mobile'
+    AND organic_results_link = 'https://www.choosetexaspower.org/energy-resources/no-deposit-electricity/'
+    AND keyword_tracked IN (
+      'no deposit electricity',
+      'light company no deposit',
+      'electricity companies with no deposit',
+      'prepaid electricity',
+      'no credit check electricity',
+      'no deposit lights',
+      'no deposit electric companies in texas',
+      'bad credit electricity',
+      'electricity companies no deposit no credit check'
+    )
+    AND location_requested IN (
+      'Houston, TX, USA',
+      'Arlington, TX, USA',
+      'Dallas, TX, USA',
+      'Corpus Christi, TX, USA',
+      'Fort Worth, TX, USA',
+      'Plano, TX',
+      'Lubbock, TX, USA'
+    )
+  GROUP BY 3, 4, 5, 6
+),
+
+Final AS (
+  SELECT * FROM TexasState WHERE Page IS NOT NULL
+  UNION ALL
+  SELECT * FROM CitySpecific WHERE Page IS NOT NULL
+  UNION ALL
+  SELECT * FROM P2C WHERE Page IS NOT NULL
+  UNION ALL
+  SELECT * FROM BestProviders WHERE Page IS NOT NULL
+  UNION ALL
+  SELECT * FROM NoDeposit WHERE Page IS NOT NULL
+)
+
+SELECT
+  AVG_TRUE_RANK,
+  AVG_WEB_RANK,
+  CASE
+    WHEN organic_results_link = 'https://www.choosetexaspower.org/' THEN 'CTXP Homepage'
+    WHEN organic_results_link = 'https://www.choosetexaspower.org/electricity-rates/' THEN 'CTXP Texas'
+    WHEN organic_results_link = 'https://www.choosetexaspower.org/electricity-rates/houston/' THEN 'CTXP Houston'
+    WHEN organic_results_link = 'https://www.choosetexaspower.org/electricity-rates/dallas/' THEN 'CTXP Dallas'
+    WHEN organic_results_link = 'https://www.choosetexaspower.org/electricity-rates/fort-worth/' THEN 'CTXP Fort Worth'
+    WHEN organic_results_link = 'https://www.choosetexaspower.org/electricity-providers/' THEN 'CTXP Best Providers'
+    WHEN organic_results_link = 'https://www.chooseenergy.com/electricity-rates/texas/' THEN 'Choose Texas'
+    WHEN organic_results_link = 'https://www.chooseenergy.com/electricity-rates/texas/houston/' THEN 'Choose Houston'
+    WHEN organic_results_link = 'https://www.chooseenergy.com/electricity-rates/texas/dallas/' THEN 'Choose Dallas'
+    WHEN organic_results_link = 'https://www.saveonenergy.com/electricity-rates/texas/' THEN 'SOE Texas'
+    WHEN organic_results_link = 'https://www.saveonenergy.com/electricity-rates/texas/houston/' THEN 'SOE Houston'
+    WHEN organic_results_link = 'https://www.choosetexaspower.org/energy-resources/no-deposit-electricity/' THEN 'CTXP No Deposit'
+    ELSE organic_results_link
+  END AS organic_results_link,
+  date,
+  Page,
+  Website,
+  SearchVolume,
+  KeywordsInTop10,
+  weighted_average_rank
+FROM Final;
