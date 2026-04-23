@@ -35,7 +35,7 @@ def _get_connection():
 def _build_query(start_date: str, end_date: str) -> str:
     """Read the session_level_query file and inject date parameters."""
     query_path = os.path.join(
-        os.path.dirname(os.path.dirname(__file__)), "session_level_query"
+        os.path.dirname(os.path.dirname(__file__)), "queries", "session_level_query"
     )
     with open(query_path) as f:
         raw = f.read()

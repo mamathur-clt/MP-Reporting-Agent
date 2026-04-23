@@ -53,7 +53,7 @@ def _get_connection():
 def fetch_finance_daily() -> pd.DataFrame:
     """Execute the finance_query file and return daily data by channel."""
     query_path = os.path.join(
-        os.path.dirname(os.path.dirname(__file__)), "finance_query"
+        os.path.dirname(os.path.dirname(__file__)), "queries", "finance_query"
     )
     with open(query_path) as f:
         raw = f.read()

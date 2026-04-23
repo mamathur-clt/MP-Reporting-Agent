@@ -32,7 +32,7 @@ DATA_START_DATE = "2026-01-01"    # earliest date for backfill / baseline
 
 # ── Paths ─────────────────────────────────────────────────────────────────
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CART_QUERY_PATH = os.path.join(REPO_ROOT, "cart_session_level_query.txt")
+CART_QUERY_PATH = os.path.join(REPO_ROOT, "queries", "cart_session_level_query.txt")
 ALERT_LOG_PATH = os.path.join(REPO_ROOT, "monitor", "alert_log.jsonl")
 COOLDOWN_LOG_PATH = os.path.join(REPO_ROOT, "monitor", "cooldown_log.json")
 CHART_DIR = os.path.join(REPO_ROOT, "monitor", "charts")
