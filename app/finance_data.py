@@ -77,28 +77,99 @@ def fetch_finance_daily() -> pd.DataFrame:
 
 @st.cache_data(ttl=3600, show_spinner="Loading plan/pacing data…")
 def fetch_plan_pacing() -> pd.DataFrame:
-    """Query rpt_texas_daily_pacing for Pacing and Plan (Final) views."""
+    """Query rpt_texas_daily_pacing for Pacing and Plan views.
+
+    Two historical gotchas to know about:
+
+    1. **Channel rename.** Pre-2026-01-01 the table uses ``MarketingChannel='Organic'``;
+       from 2026-01-01 onward it uses ``'SEO'``. The ``_CHANNEL_EXPAND`` map
+       already translates our UI label ``"Organic"`` to both values.
+
+    2. **Plan view rename.** Pre-2026-01-01 the plan row is ``performance_view='Plan'``;
+       from 2026-01-01 onward Finance publishes two views — ``'Final'`` (locked)
+       and ``'Internal Plan'`` (live / refreshed). We accept BOTH and prefer
+       ``'Final'`` when present, falling back to ``'Internal Plan'`` — matching
+       the Finance team's canonical pacing query.
+
+    3. **In-flight month pacing.** The table stores *cumulative MTD* values on
+       each daily row of ``performance_view='Pacing'``, so a single
+       ``rpt_date = <latest>`` row tells you month-to-date totals. We used to
+       hardcode ``rpt_date = CURRENT_DATE - 1`` but the table loads ~1 day
+       behind the warehouse clock, so that returned zero rows and silently
+       blanked the Pacing / Plan / vs-Plan columns. We now bind to the actual
+       ``MAX(rpt_date)`` of the Pacing view.
+    """
     query = """
-    SELECT
-        rpt_date,
-        CASE WHEN performance_view = 'Final' THEN 'Plan'
-             ELSE performance_view END AS perf_view,
-        MarketingChannel,
-        COALESCE(sessions, 0)           AS sessions,
-        COALESCE(cart_entries, 0)        AS cart_entries,
-        COALESCE(cart_orders, 0)         AS cart_orders,
-        COALESCE(phone_orders, 0)        AS phone_orders,
-        COALESCE(total_orders, 0)        AS total_orders,
-        COALESCE(serp_orders, 0)         AS serp_orders,
-        COALESCE(site_queue_calls, 0)    AS site_queue_calls,
-        COALESCE(site_phone_orders, 0)   AS site_phone_orders,
-        COALESCE(phone_revenue, 0)       AS phone_revenue,
-        COALESCE(cart_revenue, 0)        AS cart_revenue,
-        COALESCE(revenue, 0)             AS revenue
-    FROM energy_prod.energy.rpt_texas_daily_pacing
-    WHERE performance_view IN ('Pacing', 'Final')
-      AND (rpt_date = last_day(rpt_date) OR rpt_date = CURRENT_DATE - 1)
-      AND rpt_date >= '2026-01-01'
+    WITH pacing_horizon AS (
+        SELECT MAX(rpt_date) AS max_rpt_date
+        FROM energy_prod.energy.rpt_texas_daily_pacing
+        WHERE performance_view = 'Pacing'
+    ),
+    raw AS (
+        SELECT
+            tx.rpt_date,
+            tx.performance_view,
+            tx.MarketingChannel,
+            COALESCE(tx.sessions, 0)           AS sessions,
+            COALESCE(tx.cart_entries, 0)       AS cart_entries,
+            COALESCE(tx.cart_orders, 0)        AS cart_orders,
+            COALESCE(tx.phone_orders, 0)       AS phone_orders,
+            COALESCE(tx.total_orders, 0)       AS total_orders,
+            COALESCE(tx.serp_orders, 0)        AS serp_orders,
+            COALESCE(tx.site_queue_calls, 0)   AS site_queue_calls,
+            COALESCE(tx.site_phone_orders, 0)  AS site_phone_orders,
+            COALESCE(tx.phone_revenue, 0)      AS phone_revenue,
+            COALESCE(tx.cart_revenue, 0)       AS cart_revenue,
+            COALESCE(tx.revenue, 0)            AS revenue
+        FROM energy_prod.energy.rpt_texas_daily_pacing tx
+        CROSS JOIN pacing_horizon ph
+        WHERE tx.rpt_date >= '2026-01-01'
+          AND (
+              tx.performance_view IN ('Pacing', 'Final', 'Internal Plan')
+          )
+          AND (
+              -- Past months: take the locked month-end snapshot
+              (tx.rpt_date = last_day(tx.rpt_date)
+               AND date_trunc('month', tx.rpt_date) != date_trunc('month', ph.max_rpt_date))
+              -- In-flight month: take the latest fully-loaded daily row
+              OR tx.rpt_date = ph.max_rpt_date
+          )
+    ),
+    -- Collapse 'Final' and 'Internal Plan' into a single 'Plan' view,
+    -- preferring 'Final' where it exists (any rpt_date × MarketingChannel
+    -- that has a Final row drops the Internal Plan duplicate).
+    plan_dedup AS (
+        SELECT
+            rpt_date,
+            'Plan' AS perf_view,
+            MarketingChannel,
+            sessions, cart_entries, cart_orders, phone_orders, total_orders,
+            serp_orders, site_queue_calls, site_phone_orders,
+            phone_revenue, cart_revenue, revenue,
+            ROW_NUMBER() OVER (
+                PARTITION BY rpt_date, MarketingChannel
+                ORDER BY CASE performance_view
+                             WHEN 'Final' THEN 0
+                             WHEN 'Internal Plan' THEN 1
+                             ELSE 2
+                         END
+            ) AS rn
+        FROM raw
+        WHERE performance_view IN ('Final', 'Internal Plan')
+    )
+    SELECT rpt_date, 'Pacing' AS perf_view, MarketingChannel,
+           sessions, cart_entries, cart_orders, phone_orders, total_orders,
+           serp_orders, site_queue_calls, site_phone_orders,
+           phone_revenue, cart_revenue, revenue
+      FROM raw
+     WHERE performance_view = 'Pacing'
+    UNION ALL
+    SELECT rpt_date, perf_view, MarketingChannel,
+           sessions, cart_entries, cart_orders, phone_orders, total_orders,
+           serp_orders, site_queue_calls, site_phone_orders,
+           phone_revenue, cart_revenue, revenue
+      FROM plan_dedup
+     WHERE rn = 1
     """
     with _get_connection() as conn:
         cursor = conn.cursor()
@@ -108,7 +179,6 @@ def fetch_plan_pacing() -> pd.DataFrame:
     df = pd.DataFrame(rows, columns=cols)
     if "rpt_date" in df.columns:
         df["rpt_date"] = pd.to_datetime(df["rpt_date"]).dt.date
-    # Databricks returns decimal.Decimal — force everything numeric to float
     for c in df.columns:
         if c not in ("rpt_date", "perf_view", "MarketingChannel"):
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(float)
@@ -134,13 +204,13 @@ def _map_channels_for_plan(channels: list[str]) -> list[str]:
 _FIN_SUM_COLS = [
     "Total_Sessions", "ZipEntries", "CartEntries", "TotalCartOrders",
     "TotalPhoneOrders", "site_phone_orders", "site_queue_calls",
-    "Serp_Orders", "TotalCartGCV",
+    "Serp_Orders", "TotalCartGCV", "TotalPhoneGCV",
 ]
 
 _PLAN_SUM_COLS = [
     "sessions", "cart_entries", "cart_orders", "phone_orders",
     "total_orders", "serp_orders", "site_queue_calls",
-    "site_phone_orders", "cart_revenue",
+    "site_phone_orders", "cart_revenue", "phone_revenue",
 ]
 
 
@@ -149,13 +219,20 @@ def _agg(df: pd.DataFrame, cols: list[str]) -> dict:
 
 
 def _rates_finance(a: dict) -> dict:
-    """Compute funnel metrics from aggregated finance daily data."""
-    s  = a["Total_Sessions"]
-    z  = a["ZipEntries"]
-    ce = a["CartEntries"]
-    co = a["TotalCartOrders"]
+    """Compute funnel metrics from aggregated finance daily data.
+
+    Phone revenue from the finance query (`TotalPhoneGCV`) already includes
+    Site + SERP + cross-sell, which matches the plan table's `phone_revenue`.
+    Total phone orders (`TotalPhoneOrders`) also include both Site and SERP.
+    """
+    s   = a["Total_Sessions"]
+    z   = a["ZipEntries"]
+    ce  = a["CartEntries"]
+    co  = a["TotalCartOrders"]
     spo = a["site_phone_orders"]
     sqc = a["site_queue_calls"]
+    tpo = a["TotalPhoneOrders"]          # Site + SERP phone orders
+    pg  = a["TotalPhoneGCV"]             # Site + SERP + cross-sell phone revenue
     cg  = a["TotalCartGCV"]
     return {
         "LP Sessions":       s,
@@ -167,19 +244,26 @@ def _rates_finance(a: dict) -> dict:
         "Cart Conversion":   co / ce  if ce else None,
         "Cart VC":           co / s   if s  else None,
         "VC":                (co + spo) / s if s else None,
+        "Phone Rev/Order":   pg / tpo if tpo else None,
+        "Cart Rev/Order":    cg / co  if co  else None,
+        "Phone Revenue":     pg,
         "Cart Revenue":      cg,
-        "Rev/Session (Cart)": cg / s  if s  else None,
-        "Rev/order (Cart)":  cg / co  if co else None,
+        "Revenue":           pg + cg,
     }
 
 
 def _rates_plan(a: dict) -> dict:
-    """Compute funnel metrics from aggregated plan/pacing data."""
+    """Compute funnel metrics from aggregated plan/pacing data.
+
+    Plan table phone_orders/phone_revenue are Site + SERP (matches finance).
+    """
     s   = a["sessions"]
     ce  = a["cart_entries"]
     co  = a["cart_orders"]
     spo = a["site_phone_orders"]
     sqc = a["site_queue_calls"]
+    tpo = a["phone_orders"]              # plan table: Site + SERP combined
+    pr  = a["phone_revenue"]
     cr  = a["cart_revenue"]
     return {
         "LP Sessions":       s,
@@ -191,9 +275,11 @@ def _rates_plan(a: dict) -> dict:
         "Cart Conversion":   co / ce  if ce else None,
         "Cart VC":           co / s   if s  else None,
         "VC":                (co + spo) / s if s else None,
+        "Phone Rev/Order":   pr / tpo if tpo else None,
+        "Cart Rev/Order":    cr / co  if co  else None,
+        "Phone Revenue":     pr,
         "Cart Revenue":      cr,
-        "Rev/Session (Cart)": cr / s  if s  else None,
-        "Rev/order (Cart)":  cr / co  if co else None,
+        "Revenue":           pr + cr,
     }
 
 
@@ -204,24 +290,34 @@ def _pct_delta(curr, prior):
 
 
 # ── row definitions (matches the example image layout) ─────────────────────
+# Each entry: (section_header_or_None, metric_name_or_None, type, footnote_key_or_None)
+# `footnote_key` is matched against `_FOOTNOTES` in render_summary_html to
+# attach a superscript asterisk + a table footer note.
 
-_ROWS = [
-    (None,                       "LP Sessions",       "volume"),
-    ("Phone Funnel (Site Only)", None,                None),
-    (None,                       "Phone RR",          "rate"),
-    (None,                       "Phone VC",          "rate"),
-    ("Cart Funnel",              None,                None),
-    (None,                       "ZLUR",              "rate"),
-    (None,                       "G2C",               "rate"),
-    (None,                       "Cart RR",           "rate"),
-    (None,                       "Cart Conversion",   "rate"),
-    (None,                       "Cart VC",           "rate"),
-    ("Bottom Line",              None,                None),
-    (None,                       "VC",                "rate"),
-    (None,                       "Cart Revenue",      "dollar"),
-    (None,                       "Rev/Session (Cart)", "dollar"),
-    (None,                       "Rev/order (Cart)",  "dollar"),
+_ROWS: list[tuple] = [
+    (None,                       "LP Sessions",       "volume",  None),
+    ("Phone Funnel (Site Only)", None,                None,      None),
+    (None,                       "Phone RR",          "rate",    None),
+    (None,                       "Phone VC",          "rate",    None),
+    ("Cart Funnel",              None,                None,      None),
+    (None,                       "ZLUR",              "rate",    None),
+    (None,                       "G2C",               "rate",    None),
+    (None,                       "Cart RR",           "rate",    None),
+    (None,                       "Cart Conversion",   "rate",    None),
+    (None,                       "Cart VC",           "rate",    None),
+    ("Bottom Line",              None,                None,      None),
+    (None,                       "VC",                "rate",    None),
+    (None,                       "Phone Rev/Order",   "dollar",  "site_plus_serp"),
+    (None,                       "Cart Rev/Order",    "dollar",  None),
+    (None,                       "Phone Revenue",     "dollar",  "site_plus_serp"),
+    (None,                       "Cart Revenue",      "dollar",  None),
+    (None,                       "Revenue",           "dollar",  None),
 ]
+
+# Footnote text keyed by the 4th column of `_ROWS`.
+_FOOTNOTES: dict[str, str] = {
+    "site_plus_serp": "Phone metrics include both Site and SERP orders/revenue.",
+}
 
 
 # ── main builder ───────────────────────────────────────────────────────────
@@ -304,8 +400,12 @@ def build_funnel_summary(
 
     if not p4_pool.empty:
         p4_r = _rates_finance(_agg(p4_pool, _FIN_SUM_COLS))
-        p4_r["LP Sessions"]  = p4_r["LP Sessions"] / 4
-        p4_r["Cart Revenue"] = p4_r["Cart Revenue"] / 4
+        # Volume / dollar totals need to be averaged across the 4 prior weeks
+        # for a true "per-week" comparison. Rate metrics are already normalized
+        # to per-session ratios and stay as-is.
+        for _vol_metric in ("LP Sessions", "Cart Revenue", "Phone Revenue", "Revenue"):
+            if p4_r.get(_vol_metric) is not None:
+                p4_r[_vol_metric] = p4_r[_vol_metric] / 4
     else:
         p4_r = {}
 
@@ -325,13 +425,14 @@ def build_funnel_summary(
 
     # ── Assemble rows ──
     rows: list[dict] = []
-    for section, metric, mtype in _ROWS:
+    for section, metric, mtype, note_key in _ROWS:
         if section:
             rows.append({"section": section})
             continue
         rows.append({
             "metric": metric,
             "type": mtype,
+            "note_key": note_key,
             "march_pacing":  pac_r.get(metric) if pac_r else None,
             "plan_actual":   pln_r.get(metric) if pln_r else None,
             "v_plan":        _pct_delta(pac_r.get(metric), pln_r.get(metric)) if pac_r and pln_r else None,
@@ -354,7 +455,11 @@ def _fmt_val(val, mtype):
         s = f"{pct:.2f}".rstrip("0").rstrip(".")
         return s + "%"
     if mtype == "dollar":
-        return f"${val:.2f}"
+        # Per-order values (< $1k) show cents for precision; totals show as
+        # whole dollars with thousands separators.
+        if abs(val) >= 1000:
+            return f"${val:,.0f}"
+        return f"${val:,.2f}"
     return str(val)
 
 
@@ -378,17 +483,34 @@ def _delta_style(val):
     return ""
 
 
+_FOOTNOTE_MARKERS = ["*", "†", "‡", "§"]
+
+
 def render_summary_html(rows: list[dict], report_date: date, period_label: str | None = None) -> str:
-    """Render the funnel summary as an HTML table styled to match the example."""
+    """Render the funnel summary as an HTML table styled to match the example.
+
+    Rows whose ``note_key`` matches an entry in ``_FOOTNOTES`` get a
+    superscript marker (``*``, ``†``, …) after the metric name, and the
+    corresponding note is rendered beneath the table.
+    """
     month = report_date.strftime("%B")
     ds = period_label or report_date.strftime("%-m/%-d/%y")
+
+    # Assign a stable marker to each distinct note_key that actually appears.
+    keys_in_use: list[str] = []
+    for row in rows:
+        k = row.get("note_key")
+        if k and k in _FOOTNOTES and k not in keys_in_use:
+            keys_in_use.append(k)
+    note_markers = {k: _FOOTNOTE_MARKERS[i % len(_FOOTNOTE_MARKERS)]
+                    for i, k in enumerate(keys_in_use)}
 
     hdr_style = "padding:10px 12px;border:1px solid #bbb;"
     html = (
         '<table style="border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:14px;">'
         "<thead>"
         '<tr style="background:#2c3e50;color:white;text-align:center;">'
-        f'<th style="{hdr_style}text-align:left;min-width:180px;font-size:15px;">Core 4 Funnel</th>'
+        f'<th style="{hdr_style}text-align:left;min-width:180px;font-size:15px;">Core Funnel</th>'
         f'<th style="{hdr_style}">{month} Pacing</th>'
         f'<th style="{hdr_style}">Plan Actual</th>'
         f'<th style="{hdr_style}">V. Plan</th>'
@@ -421,9 +543,17 @@ def render_summary_html(rows: list[dict], report_date: date, period_label: str |
         ws = _delta_style(row.get("wow"))
         ps = _delta_style(row.get("p4wa"))
 
+        marker_html = ""
+        nk = row.get("note_key")
+        if nk and nk in note_markers:
+            marker_html = (
+                '<sup style="color:#6b6b6b;font-weight:600;margin-left:2px;">'
+                f'{note_markers[nk]}</sup>'
+            )
+
         html += (
             "<tr>"
-            f'<td style="padding:8px 14px;border:1px solid #ddd;font-weight:500;">{m}</td>'
+            f'<td style="padding:8px 14px;border:1px solid #ddd;font-weight:500;">{m}{marker_html}</td>'
             f'<td style="{cell}">{mp}</td>'
             f'<td style="{cell}">{pa}</td>'
             f'<td style="{cell}{vs}">{vp}</td>'
@@ -434,4 +564,16 @@ def render_summary_html(rows: list[dict], report_date: date, period_label: str |
         )
 
     html += "</tbody></table>"
+
+    if note_markers:
+        notes = "".join(
+            f'<div><sup style="color:#6b6b6b;font-weight:600;">{note_markers[k]}</sup> '
+            f'{_FOOTNOTES[k]}</div>'
+            for k in keys_in_use
+        )
+        html += (
+            '<div style="margin-top:6px;font-family:Arial,sans-serif;font-size:12px;'
+            f'color:#6b6b6b;line-height:1.5;">{notes}</div>'
+        )
+
     return html

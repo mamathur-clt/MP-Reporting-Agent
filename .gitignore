@@ -5,6 +5,7 @@ __pycache__/
 .ipynb_checkpoints/
 .DS_Store
 .streamlit/
+.cursor/
 monitor/charts/
 monitor/alert_log.jsonl
 monitor/cooldown_log.json

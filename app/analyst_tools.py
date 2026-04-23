@@ -19,6 +19,7 @@ from databricks import sql as databricks_sql
 from dotenv import load_dotenv
 
 from app.config import KPI_FORMULAS_TEXT
+from app.narrative import _BUSINESS_CONTEXT
 
 load_dotenv(override=True)
 os.environ["SSL_CERT_FILE"] = certifi.where()
@@ -71,10 +72,25 @@ TOOL_DEFINITIONS: list[dict] = [
                 "Run a read-only SQL SELECT query against Databricks. Use when "
                 "the question requires data outside the loaded date range or "
                 "from tables not present in the loaded DataFrames. Only SELECT / "
-                "WITH queries are allowed. Key schemas: energy_prod.energy "
-                "(v_sessions, v_carts, v_orders, v_calls, v_orders_gcv), "
-                "energy_prod.data_science, lakehouse_production.energy, "
-                "energy_prod.energy.rpt_texas_daily_pacing."
+                "WITH queries are allowed.\n\n"
+                "KEY TABLES & TRUST LEVELS:\n"
+                "  Tier 1 (FINANCE — source of truth for performance reporting):\n"
+                "    - energy_prod.energy.rpt_texas_daily_pacing — paced month projections and Plan\n"
+                "    - v_sessions, v_carts, v_orders, v_calls, v_orders_gcv in energy_prod.energy\n"
+                "  Tier 2 (SESSION-LEVEL — source of truth for decomposition/drivers):\n"
+                "    - energy_prod.data_science.mp_session_level_query\n"
+                "  Tier 3 (CHANNEL-SPECIFIC UPSTREAM):\n"
+                "    - lakehouse_production.common.gsc_search_analytics_d_5 — total organic (matches GSC dashboard)\n"
+                "    - lakehouse_production.common.gsc_search_analytics_d_3 — page-level organic\n"
+                "    - lakehouse_production.common.gsc_search_analytics_d_1 — query-level organic (undercounts)\n"
+                "    - energy_prod.energy.paidsearch_campaign — Google Ads campaign data\n\n"
+                "DATA SOURCE SELECTION:\n"
+                "  'How are we pacing?' → rpt_texas_daily_pacing\n"
+                "  'What is our revenue?' → finance views (v_sessions/v_orders)\n"
+                "  'Why did VC change?' → mp_session_level_query (decomposition)\n"
+                "  'What happened to SEO traffic?' → gsc_search_analytics_d_5\n"
+                "  'Which page types lost clicks?' → gsc_search_analytics_d_3\n"
+                "  'Which campaigns are driving paid?' → paidsearch_campaign"
             ),
             "parameters": {
                 "type": "object",
@@ -312,6 +328,10 @@ def build_analyst_system_prompt(
     """Augment the existing chat system prompt with data-access tool context."""
     return f"""{base_chat_prompt}
 
+--- BUSINESS CONTEXT ---
+
+{_BUSINESS_CONTEXT}
+
 --- DATA ACCESS TOOLS ---
 
 You have tools to query data directly. Use them to answer ad-hoc analytical questions.
@@ -331,6 +351,24 @@ TOOL USAGE GUIDELINES:
 - For rates: `col.sum() / denominator_col.sum()` (both are 0/1 flags).
 - If a tool call errors, read the error and try a corrected approach.
 - Keep output concise — aggregate or filter to the essentials before returning.
+
+DATA SOURCE SELECTION RULES:
+- "How are we pacing?" → use rpt_texas_daily_pacing (Tier 1)
+- "What is our revenue?" → finance views (Tier 1)
+- "Why did VC change?" → session-level decomposition (Tier 2)
+- "How are initiatives performing?" → session-level with initiative flags (Tier 2)
+- "What happened to SEO traffic?" → gsc_search_analytics_d_5 for total organic
+- "Which page types lost clicks?" → gsc_search_analytics_d_3 for page-level
+- "Which queries drive this page type?" → gsc_search_analytics_d_1 (accepting undercount)
+- "Which campaigns are driving paid?" → paidsearch_campaign (Tier 3)
+
+RECONCILIATION AWARENESS:
+- The `finance` DataFrame (Tier 1) is the official source of truth for performance numbers.
+- The `sessions` DataFrame (Tier 2) is session-level data used for WHY questions (decomposition, drivers, initiative impact).
+- Sessions should match closely between finance and session-level, but cart/order metrics may differ slightly due to channel attribution timing: finance assigns channel based on the cart/call session's traffic source, while session-level assigns based on the web session that started the cart.
+- When presenting both side-by-side, ALWAYS label the source (e.g., "Finance: 12,345 orders; Session-level: 12,280 orders — difference due to channel attribution timing in phone order reclassification").
+- NEVER present session-level numbers as if they were the headline metric. Finance is always the headline; session-level explains the "why."
+- If the user asks why numbers don't match, explain the channel attribution timing difference.
 
 --- END DATA ACCESS ---"""
 

@@ -9,3 +9,5 @@ openai
 apscheduler
 kaleido
 requests
+slack_bolt
+slack_sdk

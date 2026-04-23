@@ -610,7 +610,7 @@ lp_jo AS (
   FROM lakehouse_production.energy.dapi_decisions d
   LEFT JOIN energy_prod.data_science.dapi_decision_explore_exploit_classification dd
     ON dd._id = d._id
-  WHERE d.agentId = '3313'
+  WHERE d.agentId = '3577'
     AND (d.result IN ('SUCCESS', 'FAILURE') OR d.result IS NULL)
 ),
 

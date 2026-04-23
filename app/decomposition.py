@@ -187,7 +187,7 @@ def analyze_initiatives(
     agg["rate"] = np.where(agg["den"] > 0, agg["num"] / agg["den"], 0.0)
 
     # Compute holdout rate for counterfactual comparisons.
-    # FMP shares the LP holdout as its control (same agent 3313).
+    # FMP shares the LP holdout as its control (same agent 3577).
     holdout_rates = {}
     for init_type in ["LP+Grid JO", "LP JO", "Grid JO"]:
         holdout_row = agg[agg["_initiative"] == f"{init_type} Holdout"]
