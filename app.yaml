@@ -1,1 +1,5 @@
 command: ['streamlit', 'run', 'app/streamlit_app.py', '--server.port', '8501']
+
+env:
+  - name: DATABRICKS_WAREHOUSE_ID
+    valueFrom: sql-warehouse

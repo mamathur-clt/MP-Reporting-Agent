@@ -30,6 +30,10 @@ os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
 log = logging.getLogger(__name__)
 
 _HTTP_PATH = os.getenv("DATABRICKS_HTTP_PATH", "")
+if not _HTTP_PATH:
+    _wh_id = os.getenv("DATABRICKS_WAREHOUSE_ID", "")
+    if _wh_id:
+        _HTTP_PATH = f"/sql/1.0/warehouses/{_wh_id}"
 
 # Detect which auth mode to use at import time.
 _USE_SP = bool(
