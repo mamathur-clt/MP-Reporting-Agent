@@ -16,19 +16,10 @@ Field mapping assumptions (documented inline):
 import os
 from datetime import date, timedelta
 
-import certifi
 import pandas as pd
 import streamlit as st
-from databricks import sql as databricks_sql
-from dotenv import load_dotenv
 
-load_dotenv(override=True)
-os.environ["SSL_CERT_FILE"] = certifi.where()
-os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
-
-_HOST = os.getenv("DATABRICKS_HOST", "")
-_TOKEN = os.getenv("DATABRICKS_TOKEN", "")
-_HTTP_PATH = os.getenv("DATABRICKS_HTTP_PATH", "")
+from app.db import get_connection as _get_connection
 
 # Finance-query channel name → plan table equivalents
 _CHANNEL_EXPAND = {
@@ -39,17 +30,9 @@ _CHANNEL_EXPAND = {
 }
 
 
-def _get_connection():
-    return databricks_sql.connect(
-        server_hostname=_HOST.replace("https://", "").strip("/"),
-        http_path=_HTTP_PATH,
-        access_token=_TOKEN,
-    )
-
-
 # ── data fetching ──────────────────────────────────────────────────────────
 
-@st.cache_data(ttl=3600, show_spinner="Loading finance actuals…")
+@st.cache_data(ttl=1800, show_spinner="Loading finance actuals…")
 def fetch_finance_daily() -> pd.DataFrame:
     """Execute the finance_query file and return daily data by channel."""
     query_path = os.path.join(
@@ -75,7 +58,7 @@ def fetch_finance_daily() -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=3600, show_spinner="Loading plan/pacing data…")
+@st.cache_data(ttl=1800, show_spinner="Loading plan/pacing data…")
 def fetch_plan_pacing() -> pd.DataFrame:
     """Query rpt_texas_daily_pacing for Pacing and Plan views.
 

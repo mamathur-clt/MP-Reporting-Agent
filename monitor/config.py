@@ -11,11 +11,6 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-# ── Databricks credentials (shared with the main app) ─────────────────────
-DATABRICKS_HOST = os.getenv("DATABRICKS_HOST", "")
-DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN", "")
-DATABRICKS_HTTP_PATH = os.getenv("DATABRICKS_HTTP_PATH", "")
-
 # ── Slack ──────────────────────────────────────────────────────────────────
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 

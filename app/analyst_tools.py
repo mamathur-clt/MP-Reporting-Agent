@@ -12,22 +12,12 @@ import re
 import builtins as _builtins_module
 from datetime import date, timedelta, datetime
 
-import certifi
 import numpy as np
 import pandas as pd
-from databricks import sql as databricks_sql
-from dotenv import load_dotenv
 
 from app.config import KPI_FORMULAS_TEXT
+from app.db import get_connection as _get_sql_connection
 from app.narrative import _BUSINESS_CONTEXT
-
-load_dotenv(override=True)
-os.environ["SSL_CERT_FILE"] = certifi.where()
-os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
-
-_HOST = os.getenv("DATABRICKS_HOST", "")
-_TOKEN = os.getenv("DATABRICKS_TOKEN", "")
-_HTTP_PATH = os.getenv("DATABRICKS_HTTP_PATH", "")
 
 # ---------------------------------------------------------------------------
 # OpenAI function-calling tool schemas
@@ -271,14 +261,6 @@ _FORBIDDEN_SQL_RE = re.compile(
 )
 
 MAX_SQL_ROWS = 500
-
-
-def _get_sql_connection():
-    return databricks_sql.connect(
-        server_hostname=_HOST.replace("https://", "").strip("/"),
-        http_path=_HTTP_PATH,
-        access_token=_TOKEN,
-    )
 
 
 def execute_sql(query: str) -> tuple[str, object | None]:

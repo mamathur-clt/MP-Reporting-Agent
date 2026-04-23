@@ -84,6 +84,7 @@ python -m monitor.run --backfill 2026-01-01
 MP-Reporting-Agent/
 ├── app/
 │   ├── streamlit_app.py        # Main entry point
+│   ├── db.py                   # Centralized Databricks connection (PAT + OAuth)
 │   ├── tabs/                   # Tab modules (overview, organic, paid, chat)
 │   ├── config.py               # KPI definitions, dimensions, time modes
 │   ├── data.py                 # Session funnel data (Databricks)
@@ -120,17 +121,55 @@ MP-Reporting-Agent/
 │   └── business_context/       # Business spec documents
 ├── notebooks/                  # Exploratory analysis notebooks
 ├── assets/                     # Static images (SEO flowcharts)
+├── app.yaml                    # Databricks Apps launch config
 ├── requirements.txt
 └── .env                        # Credentials (git-ignored)
 ```
+
+## Deploying to Databricks Apps
+
+The app is ready to deploy as a Databricks App. The `app.yaml` at the repo
+root provides the launch command.
+
+### Steps
+
+1. In the Databricks workspace go to **Compute > Apps > Create app**.
+2. Choose **Custom**, name the app, and create it.
+3. Once compute starts, click **Deploy** and point to the Git repo (branch `main`)
+   or upload the workspace folder.
+4. Configure environment variables for the app (see table below).
+5. Grant the app's **service principal** these permissions:
+   - `SELECT` on all Unity Catalog tables the queries reference
+     (`energy_prod.energy.*`, `lakehouse_production.common.*`,
+     `lakehouse_production.energy.*`, `energy_prod.data_science.*`,
+     `energy_prod.fivetran_finance.*`)
+   - `CAN USE` on the SQL warehouse in `DATABRICKS_HTTP_PATH`
+
+### Auth modes
+
+The app auto-detects which auth to use (`app/db.py`):
+
+- **Databricks Apps** — when `DATABRICKS_CLIENT_ID` and
+  `DATABRICKS_CLIENT_SECRET` are injected by the platform, OAuth via the
+  Databricks SDK is used. No PAT needed.
+- **Local development** — falls back to `DATABRICKS_TOKEN` from `.env`.
+
+### Updating after deployment
+
+1. Make changes locally and test with `streamlit run app/streamlit_app.py`.
+2. `git push` to the repo.
+3. In the Databricks Apps UI click **Deploy** (or run
+   `databricks apps deploy <app-name>` from the CLI).
 
 ## Environment Variables
 
 | Variable | Required by | Purpose |
 |----------|------------|---------|
-| `DATABRICKS_HOST` | All | Workspace URL |
-| `DATABRICKS_TOKEN` | All | Personal access token (local dev) |
-| `DATABRICKS_HTTP_PATH` | All | SQL warehouse path |
+| `DATABRICKS_HOST` | All (local dev) | Workspace URL |
+| `DATABRICKS_TOKEN` | All (local dev) | Personal access token |
+| `DATABRICKS_HTTP_PATH` | All | SQL warehouse path (needed in both local and Databricks Apps) |
+| `DATABRICKS_CLIENT_ID` | Databricks Apps | Auto-injected by platform |
+| `DATABRICKS_CLIENT_SECRET` | Databricks Apps | Auto-injected by platform |
 | `OPENAI_API_KEY` | App (chat tab), Bot | GPT-4o for narratives and Q&A |
 | `SLACK_BOT_TOKEN` | Bot | Slack bot OAuth token |
 | `SLACK_APP_TOKEN` | Bot | Slack app-level token (Socket Mode) |

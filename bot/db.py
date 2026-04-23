@@ -1,27 +1,16 @@
 """
-Shared Databricks connection helper for the Slack bot.
+Shared Databricks helpers for the Slack bot.
 
-Consolidates the connection pattern used across app/data.py,
-app/analyst_tools.py, app/finance_data.py, and app/seo_data.py
-into a single module.
+Re-exports ``get_connection`` from the centralised ``app.db`` module and
+adds a read-only SQL execution wrapper.
 """
 
-import os
 import re
 from contextlib import contextmanager
 
-import certifi
 import pandas as pd
-from databricks import sql as databricks_sql
-from dotenv import load_dotenv
 
-load_dotenv(dotenv_path=".env", override=True)
-os.environ["SSL_CERT_FILE"] = certifi.where()
-os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
-
-_HOST = os.getenv("DATABRICKS_HOST", "")
-_TOKEN = os.getenv("DATABRICKS_TOKEN", "")
-_HTTP_PATH = os.getenv("DATABRICKS_HTTP_PATH", "")
+from app.db import get_connection as _raw_get_connection
 
 MAX_SQL_ROWS = 500
 
@@ -34,11 +23,7 @@ _FORBIDDEN_SQL_RE = re.compile(
 @contextmanager
 def get_connection():
     """Yield a Databricks SQL connection, closing it on exit."""
-    conn = databricks_sql.connect(
-        server_hostname=_HOST.replace("https://", "").strip("/"),
-        http_path=_HTTP_PATH,
-        access_token=_TOKEN,
-    )
+    conn = _raw_get_connection()
     try:
         yield conn
     finally:

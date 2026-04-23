@@ -5,30 +5,12 @@ Reads cart_session_level_query.txt, injects date parameters,
 executes against Databricks, and returns a pandas DataFrame.
 """
 
-import os
 from datetime import date, datetime, timedelta
 
-import certifi
 import pandas as pd
-from databricks import sql as databricks_sql
 
-from monitor.config import (
-    CART_QUERY_PATH,
-    DATABRICKS_HOST,
-    DATABRICKS_HTTP_PATH,
-    DATABRICKS_TOKEN,
-)
-
-os.environ["SSL_CERT_FILE"] = certifi.where()
-os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
-
-
-def _get_connection():
-    return databricks_sql.connect(
-        server_hostname=DATABRICKS_HOST.replace("https://", "").strip("/"),
-        http_path=DATABRICKS_HTTP_PATH,
-        access_token=DATABRICKS_TOKEN,
-    )
+from app.db import get_connection as _get_connection
+from monitor.config import CART_QUERY_PATH
 
 
 def _build_query(start_date: str, end_date: str) -> str:

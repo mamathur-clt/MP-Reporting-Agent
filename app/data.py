@@ -5,31 +5,12 @@ avoid re-running the ~700-line query on every interaction.
 """
 
 import os
-import ssl
 from datetime import date, timedelta
 
-import certifi
 import pandas as pd
 import streamlit as st
-from databricks import sql as databricks_sql
-from dotenv import load_dotenv
 
-load_dotenv(override=True)
-
-os.environ["SSL_CERT_FILE"] = certifi.where()
-os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
-
-_HOST = os.getenv("DATABRICKS_HOST", "")
-_TOKEN = os.getenv("DATABRICKS_TOKEN", "")
-_HTTP_PATH = os.getenv("DATABRICKS_HTTP_PATH", "")
-
-
-def _get_connection():
-    return databricks_sql.connect(
-        server_hostname=_HOST.replace("https://", "").strip("/"),
-        http_path=_HTTP_PATH,
-        access_token=_TOKEN,
-    )
+from app.db import get_connection as _get_connection
 
 
 def _build_query(start_date: str, end_date: str) -> str:

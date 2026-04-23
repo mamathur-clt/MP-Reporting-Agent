@@ -123,6 +123,11 @@ with st.sidebar:
         help="Leave empty for all websites.",
     )
 
+    st.divider()
+    if st.button("Refresh Data", help="Clear all cached queries and reload fresh data from Databricks."):
+        st.cache_data.clear()
+        st.rerun()
+
 # ---------------------------------------------------------------------------
 # Filter + split into current / prior frames used by every tab.
 # ---------------------------------------------------------------------------

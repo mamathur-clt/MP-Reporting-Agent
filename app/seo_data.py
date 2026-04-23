@@ -34,20 +34,10 @@ dashboard whereas d_1 does not.
 import os
 from datetime import date, timedelta
 
-import certifi
 import pandas as pd
 import streamlit as st
-from databricks import sql as databricks_sql
-from dotenv import load_dotenv
 
-load_dotenv(override=True)
-
-os.environ["SSL_CERT_FILE"] = certifi.where()
-os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
-
-_HOST = os.getenv("DATABRICKS_HOST", "")
-_TOKEN = os.getenv("DATABRICKS_TOKEN", "")
-_HTTP_PATH = os.getenv("DATABRICKS_HTTP_PATH", "")
+from app.db import get_connection as _get_connection
 
 # ── Defaults ──────────────────────────────────────────────────────────────
 
@@ -223,17 +213,6 @@ PAGE_FRIENDLY_NAMES: dict[str, str] = {
 
 POSITION_BUCKETS = ["1", "2", "3-5", "6-10", "11-20", "20+"]
 
-# ── Connection ────────────────────────────────────────────────────────────
-
-
-def _get_connection():
-    return databricks_sql.connect(
-        server_hostname=_HOST.replace("https://", "").strip("/"),
-        http_path=_HTTP_PATH,
-        access_token=_TOKEN,
-    )
-
-
 # ── Query builder ─────────────────────────────────────────────────────────
 
 
@@ -266,7 +245,7 @@ def _build_seo_query(start_date: str, domains: list[str], device: str) -> str:
 # ── Data fetcher ──────────────────────────────────────────────────────────
 
 
-@st.cache_data(ttl=3600, show_spinner="Querying Databricks for SEO rankings…")
+@st.cache_data(ttl=7200, show_spinner="Querying Databricks for SEO rankings…")
 def fetch_seo_rankings(
     start_date: str,
     domains: list[str] | None = None,
@@ -573,7 +552,7 @@ def align_windows_to_gsc(
     return curr_start, curr_end, prior_start, prior_end, " ".join(note_parts)
 
 
-@st.cache_data(ttl=3600, show_spinner="Loading GSC P4WA baseline…")
+@st.cache_data(ttl=7200, show_spinner="Loading GSC P4WA baseline…")
 def fetch_gsc_p4wa(
     curr_start: date,
     curr_end: date,
@@ -678,7 +657,7 @@ def fetch_gsc_p4wa(
     }
 
 
-@st.cache_data(ttl=3600, show_spinner="Loading GSC page-type baseline…")
+@st.cache_data(ttl=7200, show_spinner="Loading GSC page-type baseline…")
 def fetch_gsc_by_page_type_multi_window_avg(
     windows: tuple[tuple[date, date], ...],
     domains: tuple[str, ...] | None = None,
@@ -864,7 +843,7 @@ def build_p4wa_windows(
     return windows
 
 
-@st.cache_data(ttl=3600, show_spinner="Computing GSC page-1 churn…")
+@st.cache_data(ttl=7200, show_spinner="Computing GSC page-1 churn…")
 def fetch_gsc_page1_churn(
     curr_start: date,
     curr_end: date,
@@ -980,7 +959,7 @@ def fetch_gsc_page1_churn(
     }
 
 
-@st.cache_data(ttl=3600, show_spinner="Finding pages with the biggest click/impression drops…")
+@st.cache_data(ttl=7200, show_spinner="Finding pages with the biggest click/impression drops…")
 def fetch_gsc_top_declining_pages(
     curr_start: date,
     curr_end: date,
@@ -1087,7 +1066,7 @@ def fetch_gsc_top_declining_pages(
     ]]
 
 
-@st.cache_data(ttl=3600, show_spinner="Loading GSC site-level trends…")
+@st.cache_data(ttl=7200, show_spinner="Loading GSC site-level trends…")
 def fetch_gsc_site_trends(
     start_date: str,
     end_date: str,
@@ -1140,7 +1119,7 @@ def fetch_gsc_site_trends(
     return df
 
 
-@st.cache_data(ttl=3600, show_spinner="Loading GSC page-type breakdown…")
+@st.cache_data(ttl=7200, show_spinner="Loading GSC page-type breakdown…")
 def fetch_gsc_by_page_type(
     start_date: str,
     end_date: str,
@@ -1220,7 +1199,7 @@ def fetch_gsc_by_page_type(
     return df
 
 
-@st.cache_data(ttl=3600, show_spinner="Loading unmatched GSC URLs…")
+@st.cache_data(ttl=7200, show_spinner="Loading unmatched GSC URLs…")
 def fetch_gsc_unmatched_urls(
     start_date: str,
     end_date: str,
@@ -1314,7 +1293,7 @@ def fetch_gsc_unmatched_urls(
     return df
 
 
-@st.cache_data(ttl=3600, show_spinner="Loading top GSC queries by page type…")
+@st.cache_data(ttl=7200, show_spinner="Loading top GSC queries by page type…")
 def fetch_gsc_top_queries_by_page_type(
     start_date: str,
     end_date: str,
@@ -1400,7 +1379,7 @@ def fetch_gsc_top_queries_by_page_type(
     return df
 
 
-@st.cache_data(ttl=3600, show_spinner="Tracking top keyword rankings by page type…")
+@st.cache_data(ttl=7200, show_spinner="Tracking top keyword rankings by page type…")
 def fetch_gsc_top_keyword_tracker(
     curr_start: str,
     curr_end: str,
@@ -1600,7 +1579,7 @@ def fetch_gsc_top_keyword_tracker(
     return df
 
 
-@st.cache_data(ttl=3600, show_spinner="Loading Organic session funnel by page type…")
+@st.cache_data(ttl=7200, show_spinner="Loading Organic session funnel by page type…")
 def fetch_organic_session_funnel_by_page_type(
     start_date: str,
     end_date: str,
