@@ -1,4 +1,4 @@
-command: ['streamlit', 'run', 'app/streamlit_app.py', '--server.port', '8501']
+command: ['streamlit', 'run', 'app/streamlit_app.py', '--server.port', '8000']
 
 env:
   - name: DATABRICKS_HTTP_PATH
