@@ -124,6 +124,17 @@ with st.sidebar:
     )
 
     st.divider()
+    openai_key = st.text_input(
+        "OpenAI API Key (optional)",
+        type="password",
+        value=os.getenv("OPENAI_API_KEY", ""),
+        help="Enables AI-generated summaries and the Ask the Analyst tab. "
+             "Your key is not stored — it only lives in this browser session.",
+    )
+    if openai_key:
+        os.environ["OPENAI_API_KEY"] = openai_key
+
+    st.divider()
     if st.button("Refresh Data", help="Clear all cached queries and reload fresh data from Databricks."):
         st.cache_data.clear()
         st.rerun()

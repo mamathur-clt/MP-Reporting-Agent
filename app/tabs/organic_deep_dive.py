@@ -1343,7 +1343,7 @@ def _render_diagnostic_framework(report: DiagnosticReport) -> None:
             "The solid-orange terminal box is the framework's answer."
         )
         try:
-            st.graphviz_chart(report.render_graphviz(), use_container_width=True)
+            st.graphviz_chart(report.render_graphviz())
         except Exception as e:  # pragma: no cover — graphviz rendering failure
             st.warning(f"Live flowchart rendering failed: {e}")
 
@@ -1360,7 +1360,7 @@ def _render_diagnostic_framework(report: DiagnosticReport) -> None:
         st.caption("Reference — manager's original flowchart:")
         for path in _FLOWCHART_ASSETS:
             if os.path.exists(path):
-                st.image(path, use_container_width=True)
+                st.image(path, use_column_width=True)
 
 
 def _build_session_share_map(

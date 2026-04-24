@@ -14,12 +14,20 @@ from app.config import KPIS, DIMENSION_DISPLAY_NAMES
 load_dotenv(override=True)
 
 _client = None
+_client_key = None
 
 
 def _get_client() -> OpenAI:
-    global _client
-    if _client is None:
-        _client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    global _client, _client_key
+    key = os.getenv("OPENAI_API_KEY", "")
+    if not key:
+        raise ValueError(
+            "No OpenAI API key configured. Paste one into the sidebar to "
+            "enable AI-generated summaries."
+        )
+    if _client is None or key != _client_key:
+        _client = OpenAI(api_key=key)
+        _client_key = key
     return _client
 
 
